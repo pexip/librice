@@ -43,7 +43,7 @@ use tracing::{debug, error, info, trace, warn};
 
 static STUN_AGENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct StunAgentId(usize);
 
 impl core::ops::Deref for StunAgentId {
@@ -526,6 +526,7 @@ pub struct ConnCheckList {
     component_ids: Vec<(usize, ComponentConnectionState)>,
     local_credentials: Credentials,
     remote_credentials: Credentials,
+    remote_credentials_set: bool,
     local_candidates: Vec<ConnCheckLocalCandidate>,
     remote_candidates: Vec<Candidate>,
     // TODO: move to BinaryHeap or similar
@@ -675,6 +676,7 @@ impl ConnCheckList {
             component_ids: Vec::new(),
             local_credentials,
             remote_credentials,
+            remote_credentials_set: false,
             local_candidates: Vec::new(),
             remote_candidates: Vec::new(),
             triggered: VecDeque::new(),
@@ -712,6 +714,10 @@ impl ConnCheckList {
         self.stun_auth_local
             .set_credentials(credentials.clone().into(), IntegrityAlgorithm::Sha1);
         self.local_credentials = credentials;
+    }
+
+    pub(crate) fn local_credentials(&self) -> &Credentials {
+        &self.local_credentials
     }
 
     /// Set the remote [`Credentials`] for this checklist
@@ -771,7 +777,25 @@ impl ConnCheckList {
             request.cancel();
         }
 
+        let had_remote_credentials = self.remote_credentials_set;
         self.remote_credentials = credentials;
+        self.remote_credentials_set = true;
+        if !had_remote_credentials {
+            self.generate_checks();
+        }
+    }
+
+    pub(crate) fn remote_credentials(&self) -> Option<&Credentials> {
+        self.remote_credentials_set
+            .then_some(&self.remote_credentials)
+    }
+
+    pub(crate) fn clear_remote_credentials(&mut self) {
+        let credentials = generate_random_credentials();
+        self.stun_auth_remote
+            .set_credentials(credentials.clone().into(), IntegrityAlgorithm::Sha1);
+        self.remote_credentials = credentials;
+        self.remote_credentials_set = false;
     }
 
     /// Add a component id to this checklist
@@ -1209,6 +1233,75 @@ impl ConnCheckList {
         self.dump_check_state();
     }
 
+    pub(crate) fn restart(&mut self) {
+        self.state = CheckListState::Running;
+        self.remote_candidates.clear();
+        self.triggered.clear();
+        self.valid.clear();
+        self.nominated.clear();
+        self.local_end_of_candidates = false;
+        self.remote_end_of_candidates = false;
+        self.events.clear();
+        self.pending_turn_permissions.clear();
+        self.pending_recv.clear();
+        self.pending_turn_tcp_connect.clear();
+        self.tcp_buffers.clear();
+
+        let requests = self
+            .pairs
+            .iter_mut()
+            .filter_map(|check| check.agent_id().zip(check.stun_request.take()))
+            .collect::<Vec<_>>();
+        for (agent_id, request_id) in requests {
+            let Some(agent) = self.mut_agent_by_id(agent_id) else {
+                continue;
+            };
+            let Some(mut request) = agent.mut_request_transaction(request_id) else {
+                continue;
+            };
+            request.cancel();
+        }
+        self.pairs.clear();
+
+        for (component_id, state) in self.component_ids.iter_mut() {
+            *state = ComponentConnectionState::Connecting;
+            self.events.push_front(ConnCheckEvent::ComponentState(
+                *component_id,
+                ComponentConnectionState::Connecting,
+            ));
+        }
+    }
+
+    pub(crate) fn remove_component(&mut self, component_id: usize) {
+        let removed_check_ids = self
+            .pairs
+            .iter()
+            .filter(|check| check.pair.local.component_id == component_id)
+            .map(|check| check.conncheck_id)
+            .collect::<Vec<_>>();
+        self.component_ids.retain(|(id, _)| *id != component_id);
+        self.local_candidates
+            .retain(|candidate| candidate.candidate.component_id != component_id);
+        self.remote_candidates
+            .retain(|candidate| candidate.component_id != component_id);
+        self.triggered
+            .retain(|check_id| !removed_check_ids.contains(check_id));
+        self.valid
+            .retain(|check_id| !removed_check_ids.contains(check_id));
+        self.nominated
+            .retain(|(_check_id, pair)| pair.local.component_id != component_id);
+        self.pairs
+            .retain(|check| check.pair.local.component_id != component_id);
+        self.pending_recv
+            .retain(|pending| pending.component_id != component_id);
+        self.events.retain(|event| match event {
+            ConnCheckEvent::ComponentState(cid, _)
+            | ConnCheckEvent::SelectedPair(cid, _)
+            | ConnCheckEvent::ConsentResponseReceived(cid, _) => *cid != component_id,
+        });
+        self.dump_check_state();
+    }
+
     fn next_triggered(&mut self) -> Option<&mut ConnCheck> {
         // triggered checks referenced by these ids may be removed before the check has a chance to
         // start.  Simply remove them and continue processing.
@@ -1430,7 +1523,7 @@ impl ConnCheckList {
         )
     )]
     fn generate_checks(&mut self) {
-        if self.ice_lite {
+        if self.ice_lite || !self.remote_credentials_set {
             return;
         };
         let mut checks = Vec::new();
@@ -2165,6 +2258,168 @@ impl ConnCheckList {
         self.pending_turn_permissions.clear();
         self.agents.clear();
     }
+
+    fn component_for_agent_id(&self, agent_id: StunAgentId) -> Option<usize> {
+        self.pairs
+            .iter()
+            .find(|check| matches!(check.variant, ConnCheckVariant::Agent(id) if id == agent_id))
+            .map(|check| check.pair.local.component_id)
+            .or_else(|| {
+                self.local_candidates.iter().find_map(|candidate| {
+                    matches!(candidate.variant, LocalCandidateVariant::Agent(id) if id == agent_id)
+                        .then_some(candidate.candidate.component_id)
+                })
+            })
+    }
+
+    fn component_for_turn_id(&self, turn_id: StunAgentId) -> Option<usize> {
+        self.local_candidates.iter().find_map(|candidate| {
+            if candidate.candidate.candidate_type != CandidateType::Relayed {
+                return None;
+            }
+            let transport = candidate.candidate.transport_type;
+            let matches = self
+                .turn_client_by_allocated_address(transport, candidate.candidate.base_address)
+                .map(|(id, _)| id == turn_id)
+                .unwrap_or(false)
+                || self
+                    .turn_client_by_allocated_address(transport, candidate.candidate.address)
+                    .map(|(id, _)| id == turn_id)
+                    .unwrap_or(false);
+            matches.then_some(candidate.candidate.component_id)
+        })
+    }
+
+    fn socket_from_agent(
+        &self,
+        component_id: usize,
+        agent: &StunAgent,
+        checklist_id: usize,
+    ) -> CheckListSetSocket {
+        CheckListSetSocket {
+            checklist_id,
+            component_id,
+            transport: agent.transport(),
+            local_addr: agent.local_addr(),
+            remote_addr: if agent.transport() == TransportType::Udp {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                agent.remote_addr().unwrap()
+            },
+        }
+    }
+
+    fn socket_from_turn_client(
+        &self,
+        component_id: usize,
+        client: &TurnClient,
+        checklist_id: usize,
+    ) -> CheckListSetSocket {
+        CheckListSetSocket {
+            checklist_id,
+            component_id,
+            transport: client.transport(),
+            local_addr: client.local_addr(),
+            remote_addr: client.remote_addr(),
+        }
+    }
+
+    fn sockets(&self) -> Vec<CheckListSetSocket> {
+        let mut sockets = Vec::new();
+        for agent in &self.agents {
+            let Some(component_id) = self.component_for_agent_id(agent.id) else {
+                continue;
+            };
+            let socket = self.socket_from_agent(component_id, &agent.agent, self.checklist_id);
+            if !sockets.contains(&socket) {
+                sockets.push(socket);
+            }
+        }
+        for client in self
+            .turn_clients
+            .iter()
+            .chain(self.pending_delete_turn_clients.iter())
+        {
+            let component_id = self
+                .component_for_turn_id(client.id)
+                .or_else(|| self.component_ids.first().map(|(id, _)| *id))
+                .unwrap_or(1);
+            let socket = self.socket_from_turn_client(component_id, &client.client, self.checklist_id);
+            if !sockets.contains(&socket) {
+                sockets.push(socket);
+            }
+        }
+        sockets
+    }
+
+    fn sockets_for_component(&self, component_id: usize) -> Vec<CheckListSetSocket> {
+        self.sockets()
+            .into_iter()
+            .filter(|socket| socket.component_id == component_id)
+            .collect()
+    }
+
+    fn cleanup_unused_runtime(&mut self) {
+        let used_agents = self
+            .pairs
+            .iter()
+            .filter_map(|check| match check.variant {
+                ConnCheckVariant::Agent(agent_id) => Some(agent_id),
+                _ => None,
+            })
+            .chain(self.local_candidates.iter().filter_map(|candidate| {
+                if let LocalCandidateVariant::Agent(agent_id) = candidate.variant {
+                    Some(agent_id)
+                } else {
+                    None
+                }
+            }))
+            .collect::<BTreeSet<_>>();
+        self.agents.retain(|agent| used_agents.contains(&agent.id));
+
+        let used_turns = self
+            .local_candidates
+            .iter()
+            .filter(|candidate| candidate.candidate.candidate_type == CandidateType::Relayed)
+            .filter_map(|candidate| {
+                self.turn_client_by_allocated_address(
+                    candidate.candidate.transport_type,
+                    candidate.candidate.base_address,
+                )
+                .map(|(id, _)| id)
+                .or_else(|| {
+                    self.turn_client_by_allocated_address(
+                        candidate.candidate.transport_type,
+                        candidate.candidate.address,
+                    )
+                    .map(|(id, _)| id)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        self.turn_clients
+            .retain(|client| used_turns.contains(&client.id));
+        self.pending_delete_turn_clients
+            .retain(|client| used_turns.contains(&client.id));
+        self.pending_turn_permissions
+            .retain(|(turn_id, _transport, _ip)| used_turns.contains(turn_id));
+        self.pending_turn_tcp_connect.retain(|pending| {
+            used_turns.contains(&pending.turn_id)
+                && self
+                    .pairs
+                    .iter()
+                    .any(|check| check.conncheck_id == pending.conncheck_id)
+        });
+        let tcp_pairs = self
+            .agents
+            .iter()
+            .filter_map(|agent| {
+                (agent.agent.transport() == TransportType::Tcp)
+                    .then(|| (agent.agent.local_addr(), agent.agent.remote_addr().unwrap()))
+            })
+            .collect::<BTreeSet<_>>();
+        self.tcp_buffers
+            .retain(|key, _| tcp_pairs.contains(key));
+    }
 }
 
 /// A builder for a [`ConnCheckListSet`]
@@ -2299,6 +2554,139 @@ impl ConnCheckListSet {
     /// Get a reference to a [`ConnCheckList`] by ID
     pub fn list(&self, id: usize) -> Option<&ConnCheckList> {
         self.checklists.iter().find(|cl| cl.checklist_id == id)
+    }
+
+    pub(crate) fn restart_list(&mut self, checklist_id: usize, _now: Instant) {
+        let Some(checklist) = self.mut_list(checklist_id) else {
+            return;
+        };
+        checklist.restart();
+        self.pending_messages
+            .retain(|message| message.checklist_id != checklist_id);
+        self.pending_transmits
+            .retain(|transmit| transmit.checklist_id != checklist_id);
+        self.pending_remove_sockets
+            .retain(|socket| socket.checklist_id != checklist_id);
+        self.consent_tids
+            .retain(|(_tid, cid, _component_id)| *cid != checklist_id);
+        self.consent_responses
+            .retain(|(cid, _component_id, _revoked)| *cid != checklist_id);
+        self.completed = false;
+    }
+
+    pub(crate) fn remove_component(&mut self, checklist_id: usize, component_id: usize) {
+        let Some(checklist_i) = self
+            .checklists
+            .iter()
+            .position(|checklist| checklist.checklist_id == checklist_id)
+        else {
+            return;
+        };
+        let removed_sockets = self.checklists[checklist_i].sockets_for_component(component_id);
+        self.checklists[checklist_i].remove_component(component_id);
+        self.checklists[checklist_i].cleanup_unused_runtime();
+        self.pending_remove_sockets.retain(|socket| {
+            socket.checklist_id != checklist_id || socket.component_id != component_id
+        });
+        self.consent_tids.retain(|(_tid, cid, cid_component)| {
+            *cid != checklist_id || *cid_component != component_id
+        });
+        self.consent_responses
+            .retain(|(cid, cid_component, _revoked)| {
+                *cid != checklist_id || *cid_component != component_id
+            });
+        self.local_consent_revoked
+            .retain(|(cid, cid_component)| *cid != checklist_id || *cid_component != component_id);
+        self.completed = false;
+
+        let still_used = self
+            .checklists
+            .iter()
+            .flat_map(|checklist| checklist.sockets())
+            .collect::<Vec<_>>();
+        for socket in removed_sockets {
+            if !still_used.contains(&socket) && !self.pending_remove_sockets.contains(&socket) {
+                self.pending_remove_sockets.push_back(socket);
+            }
+        }
+
+        let (valid_runtime_ids, valid_sockets) = self
+            .list(checklist_id)
+            .map(|checklist| {
+                let runtime_ids = checklist
+                    .agents
+                    .iter()
+                    .map(|agent| agent.id)
+                    .chain(
+                        checklist
+                            .turn_clients
+                            .iter()
+                            .chain(checklist.pending_delete_turn_clients.iter())
+                            .map(|client| client.id),
+                    )
+                    .collect::<BTreeSet<_>>();
+                (runtime_ids, checklist.sockets())
+            })
+            .unwrap_or_default();
+
+        self.pending_messages.retain(|message| {
+            if message.checklist_id != checklist_id {
+                return true;
+            }
+            valid_runtime_ids.contains(&message.agent_id)
+        });
+        self.pending_transmits.retain(|transmit| {
+            if transmit.checklist_id != checklist_id {
+                return true;
+            }
+            valid_sockets.iter().any(|socket| {
+                socket.transport == transmit.transmit.transport
+                    && socket.local_addr == transmit.transmit.from
+                    && (socket.transport == TransportType::Udp
+                        || socket.remote_addr == transmit.transmit.to)
+            })
+        });
+    }
+
+    pub(crate) fn remove_list(&mut self, checklist_id: usize) {
+        let Some(checklist_i) = self
+            .checklists
+            .iter()
+            .position(|checklist| checklist.checklist_id == checklist_id)
+        else {
+            return;
+        };
+        let removed_sockets = self.checklists[checklist_i].sockets();
+        self.checklists.remove(checklist_i);
+        if self.checklist_i >= self.checklists.len() && !self.checklists.is_empty() {
+            self.checklist_i = self.checklists.len() - 1;
+        } else if self.checklists.is_empty() {
+            self.checklist_i = 0;
+        }
+        self.pending_messages
+            .retain(|message| message.checklist_id != checklist_id);
+        self.pending_transmits
+            .retain(|transmit| transmit.checklist_id != checklist_id);
+        self.pending_remove_sockets
+            .retain(|socket| socket.checklist_id != checklist_id);
+        self.consent_tids
+            .retain(|(_tid, cid, _component_id)| *cid != checklist_id);
+        self.consent_responses
+            .retain(|(cid, _component_id, _revoked)| *cid != checklist_id);
+        self.local_consent_revoked
+            .retain(|(cid, _component_id)| *cid != checklist_id);
+        self.completed = false;
+
+        let still_used = self
+            .checklists
+            .iter()
+            .flat_map(|checklist| checklist.sockets())
+            .collect::<Vec<_>>();
+        for socket in removed_sockets {
+            if !still_used.contains(&socket) && !self.pending_remove_sockets.contains(&socket) {
+                self.pending_remove_sockets.push_back(socket);
+            }
+        }
     }
 
     /// Whether the set is in the controlling mode.  This may change during the ICE negotiation
@@ -4700,7 +5088,7 @@ struct CheckListSetPendingMessage {
     consent_cid: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CheckListSetSocket {
     checklist_id: usize,
     component_id: usize,

@@ -380,6 +380,10 @@ impl ComponentState {
     pub(crate) fn state(&self) -> ComponentConnectionState {
         self.state
     }
+
+    pub(crate) fn clear_selected_pair(&mut self) {
+        self.selected_pair = None;
+    }
 }
 
 #[cfg(test)]
