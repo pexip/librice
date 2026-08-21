@@ -676,7 +676,7 @@ impl ConnCheckList {
             component_ids: Vec::new(),
             local_credentials,
             remote_credentials,
-            remote_credentials_set: false,
+            remote_credentials_set: true,
             local_candidates: Vec::new(),
             remote_candidates: Vec::new(),
             triggered: VecDeque::new(),
@@ -716,6 +716,7 @@ impl ConnCheckList {
         self.local_credentials = credentials;
     }
 
+    #[cfg(test)]
     pub(crate) fn local_credentials(&self) -> &Credentials {
         &self.local_credentials
     }
@@ -785,6 +786,7 @@ impl ConnCheckList {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remote_credentials(&self) -> Option<&Credentials> {
         self.remote_credentials_set
             .then_some(&self.remote_credentials)
@@ -2412,10 +2414,8 @@ impl ConnCheckList {
         let tcp_pairs = self
             .agents
             .iter()
-            .filter_map(|agent| {
-                (agent.agent.transport() == TransportType::Tcp)
-                    .then(|| (agent.agent.local_addr(), agent.agent.remote_addr().unwrap()))
-            })
+            .filter(|agent| agent.agent.transport() == TransportType::Tcp)
+            .map(|agent| (agent.agent.local_addr(), agent.agent.remote_addr().unwrap()))
             .collect::<BTreeSet<_>>();
         self.tcp_buffers
             .retain(|key, _| tcp_pairs.contains(key));
@@ -5655,7 +5655,7 @@ mod tests {
             .map_or(Err(IgnorableReason::IntegrityFailure), |username| {
                 validate_username(username, local_credentials, remote_credentials)
             })
-            .map_or(false, |_| true);
+            .is_ok();
 
         let mut response = if ice_controlling.is_err() && ice_controlled.is_err() {
             warn!("missing ice controlled/controlling attribute");
