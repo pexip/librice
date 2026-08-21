@@ -776,6 +776,7 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
     use alloc::vec;
     use core::time::Duration;
 
@@ -798,6 +799,10 @@ mod tests {
         )
         .priority(1234)
         .build()
+    }
+
+    fn test_password(fill: char) -> String {
+        core::iter::repeat_n(fill, 24).collect()
     }
 
     fn reply_to_check(
@@ -984,8 +989,8 @@ mod tests {
         let mut agent = Agent::default();
         let stream_id = agent.add_stream();
         let component_id = agent.mut_stream(stream_id).unwrap().add_component().unwrap();
-        let old_local = Credentials::new("luser".into(), "long-local-password-value".into());
-        let old_remote = Credentials::new("ruser".into(), "long-remote-password-value".into());
+        let old_local = Credentials::new("luser".into(), test_password('l'));
+        let old_remote = Credentials::new("ruser".into(), test_password('r'));
         let local_candidate = host_candidate(component_id, "10.0.0.1:1000".parse().unwrap());
         {
             let mut stream = agent.mut_stream(stream_id).unwrap();
@@ -1003,7 +1008,7 @@ mod tests {
             .local_candidates()
             .cloned()
             .collect::<Vec<_>>();
-        let new_local = Credentials::new("next".into(), "replacement-password-value".into());
+        let new_local = Credentials::new("next".into(), test_password('n'));
         agent.mut_stream(stream_id).unwrap().restart(new_local.clone(), now);
 
         let stream = agent.stream(stream_id).unwrap();
@@ -1048,8 +1053,8 @@ mod tests {
         let remote_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
         let local_candidate = host_candidate(component_id, local_addr);
         let remote_candidate = host_candidate(component_id, remote_addr);
-        let first_local = Credentials::new("luser".into(), "first-local-password-value".into());
-        let first_remote = Credentials::new("ruser".into(), "first-remote-password-value".into());
+        let first_local = Credentials::new("luser".into(), test_password('a'));
+        let first_remote = Credentials::new("ruser".into(), test_password('b'));
         {
             let mut stream = agent.mut_stream(stream_id).unwrap();
             stream.set_local_credentials(first_local);
@@ -1086,7 +1091,7 @@ mod tests {
             other => panic!("expected restart to emit Connecting, got {other:?}"),
         }
 
-        let second_remote = Credentials::new("rnew".into(), "second-remote-password-value".into());
+        let second_remote = Credentials::new("rnew".into(), test_password('c'));
         {
             let mut stream = agent.mut_stream(stream_id).unwrap();
             assert_eq!(stream.local_credentials(), Some(second_local.clone()));
