@@ -11,6 +11,7 @@
 //! ICE Agent implementation as specified in RFC 8445
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use core::error::Error;
@@ -30,7 +31,7 @@ use crate::conncheck::{
 use crate::consent::{self, ConsentFreshness, ConsentFreshnessPoll};
 use crate::gathering::{GatherPoll, GatheredCandidate};
 use crate::rand::rand_u64;
-use crate::stream::{Stream, StreamMut, StreamState};
+use crate::stream::{Credentials, Stream, StreamMut, StreamState};
 use crate::turn::TurnConfig;
 use stun_proto::agent::{StunError, Transmit};
 use stun_proto::types::message::StunParseError;
@@ -106,7 +107,8 @@ pub struct Agent {
     pub(crate) checklistset: ConnCheckListSet,
     pub(crate) stun_servers: Vec<(TransportType, SocketAddr)>,
     pub(crate) turn_servers: Vec<TurnConfig>,
-    streams: Vec<StreamState>,
+    streams: Vec<Option<StreamState>>,
+    removed_streams: Vec<(usize, usize)>,
     pub(crate) rto: Option<RequestRto>,
     pub(crate) consent_freshness: Option<ConsentFreshness>,
     pub(crate) consent_freshness_cfg: consent::Config,
@@ -251,6 +253,7 @@ impl AgentBuilder {
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
             streams: Vec::new(),
+            removed_streams: Vec::new(),
             rto: self.rto,
             consent_freshness,
             consent_freshness_cfg: self.consent_freshness_config,
@@ -259,6 +262,28 @@ impl AgentBuilder {
 }
 
 static AGENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+const ICE_RESTART_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub(crate) fn generate_restart_credentials() -> Credentials {
+    fn random_ice_string(len: usize) -> String {
+        let mut ret = String::with_capacity(len);
+        while ret.len() < len {
+            let mut value = rand_u64();
+            for _ in 0..11 {
+                ret.push(ICE_RESTART_ALPHABET[(value % ICE_RESTART_ALPHABET.len() as u64) as usize] as char);
+                if ret.len() == len {
+                    break;
+                }
+                value /= ICE_RESTART_ALPHABET.len() as u64;
+            }
+        }
+        ret
+    }
+
+    Credentials::new(random_ice_string(4), random_ice_string(22))
+}
 
 impl Default for Agent {
     fn default() -> Self {
@@ -327,7 +352,7 @@ impl Agent {
         final_retransmit_timeout: Duration,
     ) {
         let rto = RequestRto::from_parts(initial, max, retransmits, final_retransmit_timeout);
-        for stream in self.streams.iter_mut() {
+        for stream in self.streams.iter_mut().flatten() {
             stream.set_request_retransmits(rto.clone());
         }
         self.checklistset.set_request_retransmits(rto);
@@ -368,10 +393,54 @@ impl Agent {
     )]
     pub fn add_stream(&mut self) -> usize {
         let checklist_id = self.checklistset.new_list();
-        let id = self.streams.len();
+        let id = self
+            .streams
+            .iter()
+            .enumerate()
+            .find_map(|(idx, stream)| stream.is_none().then_some(idx))
+            .unwrap_or(self.streams.len());
         let stream = crate::stream::StreamState::new(id, checklist_id);
-        self.streams.push(stream);
+        if let Some(slot) = self.streams.get_mut(id) {
+            *slot = Some(stream);
+        } else {
+            self.streams.push(Some(stream));
+        }
         id
+    }
+
+    /// Remove a [`Stream`] from this agent without changing any other stream ids.
+    pub fn remove_stream(&mut self, id: usize) {
+        let Some(stream) = self.streams.get_mut(id).and_then(Option::take) else {
+            return;
+        };
+        let component_ids = stream
+            .component_ids_iter()
+            .collect::<Vec<_>>();
+        for component_id in component_ids {
+            if let Some(cf) = &mut self.consent_freshness {
+                cf.stop(id, component_id);
+            }
+        }
+        self.removed_streams.push((stream.checklist_id, id));
+        self.checklistset.remove_list(stream.checklist_id);
+    }
+
+    /// Restart every stream in this agent with fresh per-stream local ICE credentials.
+    ///
+    /// Existing local candidates, sockets, and TURN allocations are preserved; callers must
+    /// exchange the new credentials and remote candidates before connectivity checks can complete
+    /// again.
+    pub fn restart(&mut self, now: Instant) {
+        let stream_ids = self
+            .streams
+            .iter()
+            .enumerate()
+            .filter_map(|(id, stream)| stream.as_ref().map(|_| id))
+            .collect::<Vec<_>>();
+        for stream_id in stream_ids {
+            let credentials = generate_restart_credentials();
+            let _ = self.restart_stream_with_credentials(stream_id, credentials, now);
+        }
     }
 
     /// Close the agent loop.  Applications should wait for [`Agent::poll`] to return
@@ -386,6 +455,7 @@ impl Agent {
     pub fn close(&mut self, now: Instant) {
         info!("closing agent");
         self.checklistset.close(now);
+        self.removed_streams.clear();
 
         if let Some(cf) = &mut self.consent_freshness {
             cf.close();
@@ -437,7 +507,7 @@ impl Agent {
     ///
     /// If the stream does not exist, then `None` will be returned.
     pub fn stream(&self, id: usize) -> Option<crate::stream::Stream<'_>> {
-        if self.streams.get(id).is_some() {
+        if self.streams.get(id).and_then(Option::as_ref).is_some() {
             Some(Stream::from_agent(self, id))
         } else {
             None
@@ -445,12 +515,12 @@ impl Agent {
     }
 
     pub(crate) fn stream_state(&self, id: usize) -> Option<&crate::stream::StreamState> {
-        self.streams.get(id)
+        self.streams.get(id).and_then(Option::as_ref)
     }
 
     /// Get a [`StreamMut`] by id.  If the stream does not exist, then `None` will be returned.
     pub fn mut_stream(&mut self, id: usize) -> Option<StreamMut<'_>> {
-        if self.streams.get_mut(id).is_some() {
+        if self.streams.get_mut(id).and_then(Option::as_mut).is_some() {
             Some(StreamMut::from_agent(self, id))
         } else {
             None
@@ -461,7 +531,63 @@ impl Agent {
         &mut self,
         id: usize,
     ) -> Option<&mut crate::stream::StreamState> {
-        self.streams.get_mut(id)
+        self.streams.get_mut(id).and_then(Option::as_mut)
+    }
+
+    pub(crate) fn restart_stream_with_credentials(
+        &mut self,
+        id: usize,
+        local_credentials: Credentials,
+        now: Instant,
+    ) -> Option<()> {
+        let (checklist_id, component_ids) = {
+            let stream = self.mut_stream_state(id)?;
+            stream.clear_selected_pairs();
+            stream.set_local_credentials(local_credentials.clone());
+            stream.clear_remote_credentials();
+            (stream.checklist_id, stream.component_ids_iter().collect::<Vec<_>>())
+        };
+        let checklist = self.checklistset.mut_list(checklist_id)?;
+        checklist.set_local_credentials(local_credentials);
+        checklist.clear_remote_credentials();
+        self.checklistset.restart_list(checklist_id, now);
+        if let Some(cf) = &mut self.consent_freshness {
+            for component_id in component_ids {
+                cf.stop(id, component_id);
+            }
+        }
+        Some(())
+    }
+
+    pub(crate) fn remove_component(&mut self, stream_id: usize, component_id: usize) {
+        let checklist_id = {
+            let Some(stream) = self.mut_stream_state(stream_id) else {
+                return;
+            };
+            if !stream.remove_component(component_id) {
+                return;
+            }
+            stream.checklist_id
+        };
+        if let Some(cf) = &mut self.consent_freshness {
+            cf.stop(stream_id, component_id);
+        }
+        self.checklistset.remove_component(checklist_id, component_id);
+    }
+
+    fn stream_id_for_checklist(&self, checklist_id: usize) -> Option<usize> {
+        self.streams
+            .iter()
+            .flatten()
+            .find(|stream| stream.checklist_id == checklist_id)
+            .map(StreamState::id)
+            .or_else(|| {
+                self.removed_streams
+                    .iter()
+                    .find_map(|(retired_checklist_id, stream_id)| {
+                        (*retired_checklist_id == checklist_id).then_some(*stream_id)
+                    })
+            })
     }
 
     /// Poll the [`Agent`] for further progress to be made.  The returned value indicates what the
@@ -477,7 +603,7 @@ impl Agent {
     pub fn poll(&mut self, now: Instant) -> AgentPoll {
         let mut lowest_wait = None;
 
-        for stream in self.streams.iter_mut() {
+        for stream in self.streams.iter_mut().flatten() {
             let stream_id = stream.id();
             match stream.poll_gather(now) {
                 GatherPoll::AllocateSocket {
@@ -540,11 +666,9 @@ impl Agent {
                     local_addr: from,
                     remote_addr: to,
                 } => {
-                    if let Some(stream) =
-                        self.streams.iter().find(|s| s.checklist_id == checklist_id)
-                    {
+                    if let Some(stream_id) = self.stream_id_for_checklist(checklist_id) {
                         return AgentPoll::AllocateSocket(AgentSocket {
-                            stream_id: stream.id(),
+                            stream_id,
                             component_id: cid,
                             transport,
                             from,
@@ -561,11 +685,9 @@ impl Agent {
                     local_addr: from,
                     remote_addr: to,
                 } => {
-                    if let Some(stream) =
-                        self.streams.iter().find(|s| s.checklist_id == checklist_id)
-                    {
+                    if let Some(stream_id) = self.stream_id_for_checklist(checklist_id) {
                         return AgentPoll::RemoveSocket(AgentSocket {
-                            stream_id: stream.id(),
+                            stream_id,
                             component_id: cid,
                             transport,
                             from,
@@ -582,6 +704,7 @@ impl Agent {
                     if let Some(stream) = self
                         .streams
                         .iter_mut()
+                        .flatten()
                         .find(|s| s.checklist_id == checklist_id)
                     {
                         if let Some(component) = stream.mut_component_state(cid) {
@@ -601,8 +724,11 @@ impl Agent {
                     checklist_id,
                     event: ConnCheckEvent::SelectedPair(cid, selected),
                 } => {
-                    if let Some(stream) =
-                        self.streams.iter().find(|s| s.checklist_id == checklist_id)
+                    if let Some(stream) = self
+                        .streams
+                        .iter()
+                        .flatten()
+                        .find(|s| s.checklist_id == checklist_id)
                     {
                         if stream.component_state(cid).is_some() {
                             if !self.checklistset.ice_lite() {
@@ -645,8 +771,11 @@ impl Agent {
                     checklist_id,
                     event: ConnCheckEvent::ConsentResponseReceived(cid, revoked),
                 } => {
-                    if let Some(stream) =
-                        self.streams.iter().find(|s| s.checklist_id == checklist_id)
+                    if let Some(stream) = self
+                        .streams
+                        .iter()
+                        .flatten()
+                        .find(|s| s.checklist_id == checklist_id)
                     {
                         if let Some(cf) = &mut self.consent_freshness {
                             cf.on_response(cid, now);
@@ -675,6 +804,7 @@ impl Agent {
                             let checklist_id = self
                                 .streams
                                 .iter()
+                                .flatten()
                                 .find(|s| s.id() == stream_id)
                                 .map(|s| s.checklist_id);
 
@@ -707,6 +837,7 @@ impl Agent {
                         if let Some(component) = self
                             .streams
                             .iter_mut()
+                            .flatten()
                             .find(|s| s.id() == stream_id)
                             .and_then(|stream| stream.mut_component_state(component_id))
                         {
@@ -743,7 +874,7 @@ impl Agent {
     /// If not-None, then the provided data must be sent to the peer from the provided socket
     /// address.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<AgentTransmit> {
-        for stream in self.streams.iter_mut() {
+        for stream in self.streams.iter_mut().flatten() {
             let stream_id = stream.id();
             if let Some((_component_id, transmit)) = stream.poll_gather_transmit(now) {
                 return Some(AgentTransmit::from_data(stream_id, transmit));
@@ -753,6 +884,7 @@ impl Agent {
         if let Some(stream) = self
             .streams
             .iter()
+            .flatten()
             .find(|s| s.checklist_id == transmit.checklist_id)
         {
             Some(AgentTransmit {
@@ -951,7 +1083,7 @@ mod tests {
             .build();
 
         let stream_id = agent.add_stream();
-        let _ = agent.streams[stream_id].add_component();
+        let _ = agent.streams[stream_id].as_mut().unwrap().add_component();
         let component_id = 1;
 
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
@@ -1003,6 +1135,8 @@ mod tests {
         }
 
         let component = agent.streams[stream_id]
+            .as_ref()
+            .unwrap()
             .component_state(component_id)
             .unwrap();
         assert_eq!(component.state(), ComponentConnectionState::Failed);
@@ -1026,7 +1160,7 @@ mod tests {
             .build();
 
         let stream_id = agent.add_stream();
-        let _ = agent.streams[stream_id].add_component();
+        let _ = agent.streams[stream_id].as_mut().unwrap().add_component();
         let component_id = 1;
 
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
@@ -1078,6 +1212,8 @@ mod tests {
         }
 
         let component = agent.streams[stream_id]
+            .as_ref()
+            .unwrap()
             .component_state(component_id)
             .unwrap();
         assert_eq!(component.state(), ComponentConnectionState::Failed);
@@ -1100,7 +1236,7 @@ mod tests {
             .build();
 
         let stream_id = agent.add_stream();
-        let _ = agent.streams[stream_id].add_component();
+        let _ = agent.streams[stream_id].as_mut().unwrap().add_component();
         let component_id = 1;
 
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
@@ -1136,7 +1272,7 @@ mod tests {
             now,
         );
 
-        let checklist_id = agent.streams[stream_id].checklist_id;
+        let checklist_id = agent.streams[stream_id].as_ref().unwrap().checklist_id;
         agent
             .mut_stream(stream_id)
             .unwrap()
@@ -1205,6 +1341,61 @@ mod tests {
         let read_cfg = agent.consent_freshness_config().unwrap();
         assert_eq!(read_cfg.interval, Duration::from_secs(10));
         assert_eq!(read_cfg.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn remove_stream_keeps_other_ids_stable() {
+        use crate::candidate::{Candidate, CandidateType, TransportType};
+
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let mut agent = Agent::default();
+        let stream1 = agent.add_stream();
+        let stream2 = agent.add_stream();
+        let component1 = agent.mut_stream(stream1).unwrap().add_component().unwrap();
+        let component2 = agent.mut_stream(stream2).unwrap().add_component().unwrap();
+        agent
+            .mut_stream(stream1)
+            .unwrap()
+            .add_local_candidate(
+                Candidate::builder(
+                    component1,
+                    CandidateType::Host,
+                    TransportType::Udp,
+                    "a",
+                    "10.0.0.1:1000".parse().unwrap(),
+                )
+                .priority(100)
+                .build(),
+            );
+        agent
+            .mut_stream(stream2)
+            .unwrap()
+            .add_local_candidate(
+                Candidate::builder(
+                    component2,
+                    CandidateType::Host,
+                    TransportType::Udp,
+                    "b",
+                    "10.0.0.1:1002".parse().unwrap(),
+                )
+                .priority(100)
+                .build(),
+            );
+
+        agent.remove_stream(stream1);
+        assert!(agent.stream(stream1).is_none());
+        assert!(agent.stream(stream2).is_some());
+
+        let AgentPoll::RemoveSocket(removed) = agent.poll(now) else {
+            panic!("expected RemoveSocket for removed stream");
+        };
+        assert_eq!(removed.stream_id, stream1);
+        assert_eq!(removed.component_id, component1);
+
+        let replacement = agent.add_stream();
+        assert_eq!(replacement, stream1);
+        assert!(agent.stream(stream2).is_some());
     }
 
     #[test]

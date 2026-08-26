@@ -364,6 +364,11 @@ impl ConsentFreshness {
     pub(crate) fn set_config(&mut self, config: Config) {
         self.config = config;
     }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[cfg(test)]

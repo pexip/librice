@@ -18,7 +18,7 @@ use stun_proto::Instant;
 use stun_proto::agent::{StunError, Transmit};
 use stun_proto::types::data::Data;
 
-use crate::agent::{Agent, AgentError};
+use crate::agent::{generate_restart_credentials, Agent, AgentError};
 use crate::component::{Component, ComponentMut, ComponentState, GatherProgress};
 use crate::conncheck::{HandleRecvReply, PendingRecv, RecvIgnorable, RequestRto};
 
@@ -255,6 +255,26 @@ impl<'a> StreamMut<'a> {
         Ok(component_id)
     }
 
+    /// Remove a `Component` from this stream without changing any other component ids.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rice_proto::agent::Agent;
+    /// let mut agent = Agent::default();
+    /// let stream_id = agent.add_stream();
+    /// let mut stream = agent.mut_stream(stream_id).unwrap();
+    /// let component_id = stream.add_component().unwrap();
+    /// stream.remove_component(component_id);
+    /// assert!(stream.component(component_id).is_none());
+    /// ```
+    pub fn remove_component(&mut self, index: usize) {
+        if index < 1 {
+            return;
+        }
+        self.agent.remove_component(self.id, index);
+    }
+
     /// Retrieve mutable access to a component in this stream.  `None` will be returned if the
     /// component does not exist
     pub fn mut_component(&mut self, index: usize) -> Option<ComponentMut<'_>> {
@@ -309,6 +329,39 @@ impl<'a> StreamMut<'a> {
         let checklist_id = stream_state.checklist_id;
         let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
         checklist.set_remote_credentials(credentials);
+    }
+
+    /// Restart this stream with explicit local ICE credentials.
+    ///
+    /// Existing local candidates, sockets, and TURN allocations are preserved; callers must
+    /// exchange the new credentials and remote candidates before connectivity checks can complete
+    /// again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rice_proto::agent::Agent;
+    /// # use rice_proto::stream::Credentials;
+    /// # use stun_proto::Instant;
+    /// let mut agent = Agent::default();
+    /// let stream_id = agent.add_stream();
+    /// let mut stream = agent.mut_stream(stream_id).unwrap();
+    /// let credentials = Credentials::new("ufrag".into(), "a-very-long-password-value".into());
+    /// stream.restart(credentials.clone(), Instant::ZERO);
+    /// assert_eq!(stream.local_credentials(), Some(credentials));
+    /// assert!(stream.remote_credentials().is_none());
+    /// ```
+    pub fn restart(&mut self, local_credentials: Credentials, now: Instant) {
+        let _ = self
+            .agent
+            .restart_stream_with_credentials(self.id, local_credentials, now);
+    }
+
+    /// Restart this stream with fresh random local ICE credentials.
+    pub fn restart_with_random_credentials(&mut self, now: Instant) -> Credentials {
+        let credentials = generate_restart_credentials();
+        self.restart(credentials.clone(), now);
+        credentials
     }
 
     /// Add a remote candidate for connection checks for use with this stream
@@ -424,7 +477,6 @@ impl<'a> StreamMut<'a> {
         )
     )]
     pub fn end_of_remote_candidates(&mut self) {
-        // FIXME: how to deal with ice restarts?
         let stream_state = self.agent.mut_stream_state(self.id).unwrap();
         let checklist_id = stream_state.checklist_id;
         let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
@@ -560,7 +612,7 @@ impl StreamState {
             .unwrap_or((self.components.len(), &None))
             .0;
         info!("adding component {}", index + 1);
-        if self.components.get(index).is_some() {
+        if matches!(self.components.get(index), Some(Some(_))) {
             return Err(AgentError::AlreadyExists);
         }
         while self.components.len() <= index {
@@ -572,13 +624,21 @@ impl StreamState {
         Ok(index + 1)
     }
 
+    pub(crate) fn remove_component(&mut self, component_id: usize) -> bool {
+        if component_id < 1 || component_id > self.components.len() {
+            return false;
+        }
+        self.components[component_id - 1] = None;
+        true
+    }
+
     #[tracing::instrument(
         skip(self),
         fields(
             stream.id = self.id
         )
     )]
-    fn set_local_credentials(&mut self, credentials: Credentials) {
+    pub(crate) fn set_local_credentials(&mut self, credentials: Credentials) {
         info!("setting");
         self.local_credentials = Some(credentials.clone());
     }
@@ -593,13 +653,27 @@ impl StreamState {
             stream.id = self.id()
         )
     )]
-    fn set_remote_credentials(&mut self, credentials: Credentials) {
+    pub(crate) fn set_remote_credentials(&mut self, credentials: Credentials) {
         info!("setting");
         self.remote_credentials = Some(credentials.clone());
     }
 
+    pub(crate) fn clear_remote_credentials(&mut self) {
+        self.remote_credentials = None;
+    }
+
     pub(crate) fn remote_credentials(&self) -> Option<Credentials> {
         self.remote_credentials.clone()
+    }
+
+    pub(crate) fn component_ids_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.components.iter().flatten().map(|component| component.id)
+    }
+
+    pub(crate) fn clear_selected_pairs(&mut self) {
+        for component in self.components.iter_mut().flatten() {
+            component.clear_selected_pair();
+        }
     }
 
     pub(crate) fn handle_incoming_data<T: AsRef<[u8]> + core::fmt::Debug>(
@@ -702,8 +776,102 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+    use core::time::Duration;
+
     use crate::agent::{Agent, AgentPoll};
     use crate::candidate::{Candidate, CandidateType, TcpType, TransportType};
+    use crate::component::ComponentConnectionState;
+    use stun_proto::auth::ShortTermAuth;
+    use stun_proto::types::attribute::XorMappedAddress;
+    use stun_proto::types::message::{
+        IntegrityAlgorithm, Message, MessageWrite, MessageWriteExt, MessageWriteVec,
+    };
+
+    fn host_candidate(component_id: usize, addr: SocketAddr) -> Candidate {
+        Candidate::builder(
+            component_id,
+            CandidateType::Host,
+            TransportType::Udp,
+            "foundation",
+            addr,
+        )
+        .priority(1234)
+        .build()
+    }
+
+    fn test_password(fill: char) -> String {
+        core::iter::repeat_n(fill, 24).collect()
+    }
+
+    fn reply_to_check(
+        agent: &mut Agent,
+        stream_id: usize,
+        component_id: usize,
+        transmit: crate::agent::AgentTransmit,
+        remote: &Credentials,
+        now: Instant,
+    ) {
+        let request = Message::from_bytes(&transmit.transmit.data).unwrap();
+        let mut auth = ShortTermAuth::new();
+        auth.set_credentials(remote.clone().into(), IntegrityAlgorithm::Sha1);
+        let mut response = Message::builder_success(&request, MessageWriteVec::new());
+        response
+            .add_attribute(&XorMappedAddress::new(transmit.transmit.from, request.transaction_id()))
+            .unwrap();
+        let mut response = auth.sign_outgoing_message(response).unwrap();
+        response.add_fingerprint().unwrap();
+        let response = response.finish();
+        let reply = Transmit::new(
+            response.as_slice(),
+            transmit.transmit.transport,
+            transmit.transmit.to,
+            transmit.transmit.from,
+        );
+        let handled = agent
+            .mut_stream(stream_id)
+            .unwrap()
+            .handle_incoming_data(component_id, reply, now);
+        assert!(handled.handled);
+    }
+
+    fn complete_check_cycle(
+        agent: &mut Agent,
+        stream_id: usize,
+        component_id: usize,
+        remote: &Credentials,
+        mut now: Instant,
+    ) -> Instant {
+        for _ in 0..16 {
+            match agent.poll(now) {
+                AgentPoll::ComponentStateChange(change) => {
+                    assert_eq!(change.stream_id, stream_id);
+                    assert_eq!(change.component_id, component_id);
+                    assert!(
+                        matches!(
+                            change.state,
+                            ComponentConnectionState::Connecting | ComponentConnectionState::Connected
+                        ),
+                        "unexpected component state {change:?}"
+                    );
+                }
+                AgentPoll::SelectedPair(selected) => {
+                    assert_eq!(selected.stream_id, stream_id);
+                    assert_eq!(selected.component_id, component_id);
+                    return now;
+                }
+                AgentPoll::WaitUntil(wait) => {
+                    now = wait;
+                }
+                other => panic!("unexpected poll result during conncheck cycle: {other:?}"),
+            }
+            if let Some(transmit) = agent.poll_transmit(now) {
+                reply_to_check(agent, stream_id, component_id, transmit, remote, now);
+            }
+        }
+        panic!("connectivity checks did not complete");
+    }
 
     #[test]
     fn getters_setters() {
@@ -812,5 +980,170 @@ mod tests {
             agent.poll_transmit(now).is_some(),
             "checklist should emit STUN after allocated_socket"
         );
+    }
+
+    #[test]
+    fn restart_preserves_local_candidates_and_clears_remote_credentials() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let mut agent = Agent::default();
+        let stream_id = agent.add_stream();
+        let component_id = agent.mut_stream(stream_id).unwrap().add_component().unwrap();
+        let old_local = Credentials::new("luser".into(), test_password('l'));
+        let old_remote = Credentials::new("ruser".into(), test_password('r'));
+        let local_candidate = host_candidate(component_id, "10.0.0.1:1000".parse().unwrap());
+        {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            stream.set_local_credentials(old_local);
+            stream.set_remote_credentials(old_remote);
+            assert!(stream.add_local_candidate(local_candidate.clone()));
+            stream.add_remote_candidate(host_candidate(component_id, "10.0.0.2:2000".parse().unwrap()));
+            stream.end_of_local_candidates();
+            stream.end_of_remote_candidates();
+        }
+
+        let before = agent
+            .stream(stream_id)
+            .unwrap()
+            .local_candidates()
+            .cloned()
+            .collect::<Vec<_>>();
+        let new_local = Credentials::new("next".into(), test_password('n'));
+        agent.mut_stream(stream_id).unwrap().restart(new_local.clone(), now);
+
+        let stream = agent.stream(stream_id).unwrap();
+        let after = stream.local_candidates().cloned().collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert_eq!(stream.local_credentials(), Some(new_local.clone()));
+        assert!(stream.remote_credentials().is_none());
+
+        let checklist_id = agent.stream_state(stream_id).unwrap().checklist_id;
+        let checklist = agent.checklistset.list(checklist_id).unwrap();
+        assert_eq!(checklist.local_credentials(), &new_local);
+        assert!(checklist.remote_credentials().is_none());
+
+        match agent.poll(now) {
+            AgentPoll::ComponentStateChange(change) => {
+                assert_eq!(change.component_id, component_id);
+                assert_eq!(change.state, ComponentConnectionState::Connecting);
+            }
+            other => panic!("expected restart to reset component state, got {other:?}"),
+        }
+        assert!(
+            !matches!(agent.poll(now), AgentPoll::RemoveSocket(_)),
+            "restart must preserve sockets backing local candidates"
+        );
+    }
+
+    #[test]
+    fn restart_rearms_end_of_candidates_and_reselects_pair() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let config = crate::consent::Config {
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
+        };
+        let mut agent = Agent::builder()
+            .controlling(true)
+            .consent_freshness_config(config)
+            .build();
+        let stream_id = agent.add_stream();
+        let component_id = agent.mut_stream(stream_id).unwrap().add_component().unwrap();
+        let local_addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let remote_addr: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let local_candidate = host_candidate(component_id, local_addr);
+        let remote_candidate = host_candidate(component_id, remote_addr);
+        let first_local = Credentials::new("luser".into(), test_password('a'));
+        let first_remote = Credentials::new("ruser".into(), test_password('b'));
+        {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            stream.set_local_credentials(first_local);
+            stream.set_remote_credentials(first_remote.clone());
+            assert!(stream.add_local_candidate(local_candidate.clone()));
+            stream.add_remote_candidate(remote_candidate.clone());
+            stream.end_of_local_candidates();
+            stream.end_of_remote_candidates();
+        }
+
+        let mut now = complete_check_cycle(&mut agent, stream_id, component_id, &first_remote, now);
+        match agent.poll(now) {
+            AgentPoll::ComponentStateChange(change) => {
+                assert_eq!(change.component_id, component_id);
+                assert_eq!(change.state, ComponentConnectionState::Connected);
+            }
+            other => panic!("expected Connected after initial SelectedPair, got {other:?}"),
+        }
+        assert_eq!(agent.consent_freshness.as_ref().unwrap().len(), 1);
+
+        let second_local = agent
+            .mut_stream(stream_id)
+            .unwrap()
+            .restart_with_random_credentials(now);
+        assert!(second_local.ufrag.len() >= 4);
+        assert!(second_local.passwd.len() >= 22);
+        assert_eq!(agent.consent_freshness.as_ref().unwrap().len(), 0);
+
+        match agent.poll(now) {
+            AgentPoll::ComponentStateChange(change) => {
+                assert_eq!(change.component_id, component_id);
+                assert_eq!(change.state, ComponentConnectionState::Connecting);
+            }
+            other => panic!("expected restart to emit Connecting, got {other:?}"),
+        }
+
+        let second_remote = Credentials::new("rnew".into(), test_password('c'));
+        {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            assert_eq!(stream.local_credentials(), Some(second_local.clone()));
+            assert!(stream.remote_credentials().is_none());
+            stream.set_remote_credentials(second_remote.clone());
+            stream.add_remote_candidate(remote_candidate);
+            stream.end_of_local_candidates();
+            stream.end_of_remote_candidates();
+        }
+
+        now = complete_check_cycle(&mut agent, stream_id, component_id, &second_remote, now);
+        assert_eq!(agent.consent_freshness.as_ref().unwrap().len(), 1);
+        assert!(!matches!(agent.poll(now), AgentPoll::RemoveSocket(_)));
+    }
+
+    #[test]
+    fn remove_component_removes_resources_and_reuses_slot() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let mut agent = Agent::default();
+        let stream_id = agent.add_stream();
+        let (component1, component2) = {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            let component1 = stream.add_component().unwrap();
+            let component2 = stream.add_component().unwrap();
+            assert!(stream.add_local_candidate(host_candidate(component1, "10.0.0.1:1000".parse().unwrap())));
+            assert!(stream.add_local_candidate(host_candidate(component2, "10.0.0.1:1002".parse().unwrap())));
+            (component1, component2)
+        };
+
+        agent
+            .mut_stream(stream_id)
+            .unwrap()
+            .remove_component(component1);
+        let stream = agent.stream(stream_id).unwrap();
+        assert!(stream.component(component1).is_none());
+        assert!(stream.component(component2).is_some());
+        assert_eq!(
+            stream
+                .local_candidates()
+                .map(|candidate| candidate.component_id)
+                .collect::<Vec<_>>(),
+            vec![component2]
+        );
+
+        let AgentPoll::RemoveSocket(removed) = agent.poll(now) else {
+            panic!("expected removed component socket");
+        };
+        assert_eq!(removed.stream_id, stream_id);
+        assert_eq!(removed.component_id, component1);
+
+        let reused = agent.mut_stream(stream_id).unwrap().add_component().unwrap();
+        assert_eq!(reused, component1);
     }
 }

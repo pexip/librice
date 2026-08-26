@@ -380,6 +380,10 @@ impl ComponentState {
     pub(crate) fn state(&self) -> ComponentConnectionState {
         self.state
     }
+
+    pub(crate) fn clear_selected_pair(&mut self) {
+        self.selected_pair = None;
+    }
 }
 
 #[cfg(test)]
@@ -506,10 +510,11 @@ mod tests {
         .build();
         let pair = CandidatePair::new(local.clone(), remote.clone());
 
-        let mut c = stream.mut_component(component_id).unwrap();
-        c.set_selected_pair(pair).unwrap();
-        assert!(c.selected_pair().is_some());
-        drop(c);
+        {
+            let mut c = stream.mut_component(component_id).unwrap();
+            c.set_selected_pair(pair).unwrap();
+            assert!(c.selected_pair().is_some());
+        }
 
         let pair2 = CandidatePair::new(local, remote);
         let mut c = stream.mut_component(component_id).unwrap();
