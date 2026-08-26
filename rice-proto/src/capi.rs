@@ -2978,6 +2978,9 @@ pub unsafe extern "C" fn rice_stream_get_component(
 
 /// Start gathering candidates for every component in a stream with the provided local socket
 /// addresses.
+///
+/// Components are started in stream order. If a later component fails after an earlier component
+/// has already begun gathering, the earlier component continues gathering.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rice_stream_gather_candidates(
     stream: *mut RiceStream,
@@ -3041,7 +3044,11 @@ pub unsafe extern "C" fn rice_stream_gather_candidates(
 
         let component_ids = proto_stream.component_ids_iter().collect::<Vec<_>>();
         for component_id in component_ids {
-            let mut proto_component = proto_stream.mut_component(component_id).unwrap();
+            let Some(mut proto_component) = proto_stream.mut_component(component_id) else {
+                drop(proto_agent);
+                core::mem::forget(stream);
+                return RiceError::ResourceNotFound;
+            };
             let ret =
                 proto_component.gather_candidates(&sockets, &stun_servers, turn_servers.as_slice());
             if let Err(err) = ret {

@@ -1173,7 +1173,7 @@ unsafe extern "C" {
     ) -> *mut RiceComponent;
 }
 unsafe extern "C" {
-    #[doc = " Start gathering candidates for every component in a stream with the provided local socket\n addresses."]
+    #[doc = " Start gathering candidates for every component in a stream with the provided local socket\n addresses.\n\n Components are started in stream order. If a later component fails after an earlier component\n has already begun gathering, the earlier component continues gathering."]
     pub fn rice_stream_gather_candidates(
         stream: *mut RiceStream,
         sockets_len: usize,
