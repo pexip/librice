@@ -68,15 +68,15 @@ use crate::turn::OpensslTurnConfig;
 #[cfg(feature = "rustls")]
 use crate::turn::RustlsTurnConfig;
 use crate::turn::{TurnClient, TurnConfig, TurnCredentials, TurnTlsConfig};
-use stun_proto::Instant;
 use stun_proto::agent::{StunError, Transmit};
 use stun_proto::auth::Feature;
-use stun_proto::types::AddressFamily;
 use stun_proto::types::data::{Data, DataOwned, DataSlice};
 use stun_proto::types::message::IntegrityAlgorithm;
+use stun_proto::types::AddressFamily;
+use stun_proto::Instant;
 
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
 
 pub use rice_ctypes::{RiceAddress, RiceError, RiceTransportType};
 
@@ -239,6 +239,19 @@ pub unsafe extern "C" fn rice_agent_close(agent: *const RiceAgent, now_nanos: i6
         let agent = Arc::from_raw(agent);
         let mut proto_agent = agent.proto_agent.lock().unwrap();
         proto_agent.close(Instant::from_nanos(now_nanos));
+
+        drop(proto_agent);
+        core::mem::forget(agent);
+    }
+}
+
+/// Restart every stream in the `RiceAgent` with fresh local ICE credentials.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_agent_restart(agent: *const RiceAgent, now_nanos: i64) {
+    unsafe {
+        let agent = Arc::from_raw(agent);
+        let mut proto_agent = agent.proto_agent.lock().unwrap();
+        proto_agent.restart(Instant::from_nanos(now_nanos));
 
         drop(proto_agent);
         core::mem::forget(agent);
@@ -1881,6 +1894,48 @@ pub unsafe extern "C" fn rice_stream_set_remote_credentials(
     }
 }
 
+/// Restart this `RiceStream` with explicit local ICE credentials.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_stream_restart_with_credentials(
+    stream: *mut RiceStream,
+    credentials: *const RiceCredentials,
+    now_nanos: i64,
+) -> RiceError {
+    unsafe {
+        let creds = Box::from_raw(mut_override(credentials));
+        let stream = Arc::from_raw(stream);
+        let mut proto_agent = stream.proto_agent.lock().unwrap();
+        let ret = if let Some(mut proto_stream) = proto_agent.mut_stream(stream.stream_id) {
+            proto_stream.restart(creds.credentials.clone(), Instant::from_nanos(now_nanos));
+            RiceError::Success
+        } else {
+            RiceError::ResourceNotFound
+        };
+        drop(proto_agent);
+        core::mem::forget(stream);
+        core::mem::forget(creds);
+        ret
+    }
+}
+
+/// Restart this `RiceStream` with fresh random local ICE credentials.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_stream_restart(stream: *mut RiceStream, now_nanos: i64) -> RiceError {
+    unsafe {
+        let stream = Arc::from_raw(stream);
+        let mut proto_agent = stream.proto_agent.lock().unwrap();
+        let ret = if let Some(mut proto_stream) = proto_agent.mut_stream(stream.stream_id) {
+            let _ = proto_stream.restart_with_random_credentials(Instant::from_nanos(now_nanos));
+            RiceError::Success
+        } else {
+            RiceError::ResourceNotFound
+        };
+        drop(proto_agent);
+        core::mem::forget(stream);
+        ret
+    }
+}
+
 /// The type of the TCP candidate.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -2921,6 +2976,91 @@ pub unsafe extern "C" fn rice_stream_get_component(
     }
 }
 
+/// Start gathering candidates for every component in a stream with the provided local socket
+/// addresses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_stream_gather_candidates(
+    stream: *mut RiceStream,
+    sockets_len: usize,
+    sockets_addr: *const *const RiceAddress,
+    sockets_transports: *const RiceTransportType,
+    turn_len: usize,
+    turn_sockets: *const *const RiceAddress,
+    turn_config: *const *mut RiceTurnConfig,
+) -> RiceError {
+    unsafe {
+        let stream = Arc::from_raw(stream);
+        let stun_servers = {
+            let Some(agent) = stream.weak_agent.upgrade() else {
+                core::mem::forget(stream);
+                return RiceError::ResourceNotFound;
+            };
+            let agent = agent.inner.lock().unwrap();
+            agent.stun_servers.clone()
+        };
+        let mut proto_agent = stream.proto_agent.lock().unwrap();
+        let Some(mut proto_stream) = proto_agent.mut_stream(stream.stream_id) else {
+            drop(proto_agent);
+            core::mem::forget(stream);
+            return RiceError::ResourceNotFound;
+        };
+
+        let sockets_addr = core::slice::from_raw_parts(sockets_addr, sockets_len);
+        let sockets_transport = core::slice::from_raw_parts(sockets_transports, sockets_len);
+
+        let sockets = sockets_transport
+            .iter()
+            .zip(sockets_addr.iter())
+            .map(|(&transport, addr)| {
+                let socket_addr = RiceAddress::into_rice_none(*addr).inner();
+                (transport_type_from_c(transport), socket_addr)
+            })
+            .collect::<Vec<_>>();
+
+        let turn_sockets = if turn_len > 0 {
+            core::slice::from_raw_parts(turn_sockets, turn_len)
+        } else {
+            &[]
+        };
+        let turn_configs = if turn_len > 0 {
+            core::slice::from_raw_parts(turn_config, turn_len)
+                .iter()
+                .map(|config| RiceTurnConfig::into_rice_full(*config))
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let turn_servers = turn_sockets
+            .iter()
+            .zip(turn_configs.iter())
+            .map(|(socket, config)| {
+                let turn_addr = RiceAddress::into_rice_none(*socket);
+                (turn_addr.inner(), &config.0)
+            })
+            .collect::<Vec<_>>();
+
+        let component_ids = proto_stream.component_ids_iter().collect::<Vec<_>>();
+        for component_id in component_ids {
+            let mut proto_component = proto_stream.mut_component(component_id).unwrap();
+            let ret =
+                proto_component.gather_candidates(&sockets, &stun_servers, turn_servers.as_slice());
+            if let Err(err) = ret {
+                drop(proto_agent);
+                core::mem::forget(stream);
+                return match err {
+                    AgentError::AlreadyInProgress => RiceError::AlreadyInProgress,
+                    AgentError::ResourceNotFound => RiceError::ResourceNotFound,
+                    _ => RiceError::Failed,
+                };
+            }
+        }
+
+        drop(proto_agent);
+        core::mem::forget(stream);
+        RiceError::Success
+    }
+}
+
 /// Start gathering candidates for a component with the provided local socket addresses.
 ///
 /// - `component`: The component to start gathering.
@@ -3268,6 +3408,7 @@ mod tests {
 
     use alloc::string::ToString;
 
+    use std::collections::BTreeSet;
     use std::eprintln;
 
     #[test]
@@ -3435,6 +3576,95 @@ mod tests {
             rice_agent_poll_clear(&mut ret);
 
             rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_stream_restart_capi() {
+        unsafe {
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let local =
+                credentials_to_c(Credentials::new("luser".to_string(), "lpass".to_string()));
+            let remote =
+                credentials_to_c(Credentials::new("ruser".to_string(), "rpass".to_string()));
+
+            rice_stream_set_local_credentials(stream, local);
+            rice_credentials_free(local);
+            rice_stream_set_remote_credentials(stream, remote);
+            rice_credentials_free(remote);
+
+            let before = rice_stream_get_local_credentials(stream);
+            assert!(!before.is_null());
+            let current_remote = rice_stream_get_remote_credentials(stream);
+            assert!(!current_remote.is_null());
+            rice_credentials_free(current_remote);
+
+            assert_eq!(rice_stream_restart(stream, 0), RiceError::Success);
+
+            let after = rice_stream_get_local_credentials(stream);
+            assert!(!after.is_null());
+            assert!(!rice_credentials_eq(before, after));
+            assert!(rice_stream_get_remote_credentials(stream).is_null());
+
+            rice_credentials_free(before);
+            rice_credentials_free(after);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_stream_gather_candidates_capi() {
+        unsafe {
+            let addr: SocketAddr = "192.168.0.1:1000".parse().unwrap();
+            let addr = RiceAddress::new(addr).into_c_full();
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component1 = rice_stream_add_component(stream);
+            let component2 = rice_stream_add_component(stream);
+            let local =
+                credentials_to_c(Credentials::new("luser".to_string(), "lpass".to_string()));
+            let remote =
+                credentials_to_c(Credentials::new("ruser".to_string(), "rpass".to_string()));
+
+            rice_stream_set_local_credentials(stream, local);
+            rice_credentials_free(local);
+            rice_stream_set_remote_credentials(stream, remote);
+            rice_credentials_free(remote);
+
+            assert_eq!(
+                rice_stream_gather_candidates(
+                    stream,
+                    1,
+                    &addr,
+                    &transport_type_to_c(TransportType::Udp),
+                    0,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                ),
+                RiceError::Success
+            );
+            rice_address_free(mut_override(addr));
+
+            let mut gathered_components = BTreeSet::new();
+            for _ in 0..8 {
+                let mut poll = RiceAgentPoll::Closed;
+                rice_agent_poll(agent, 0, &mut poll);
+                if let RiceAgentPoll::GatheredCandidate(ref candidate) = poll {
+                    gathered_components.insert(candidate.gathered.candidate.component_id);
+                }
+                rice_agent_poll_clear(&mut poll);
+                if gathered_components.len() == 2 {
+                    break;
+                }
+            }
+            assert_eq!(gathered_components, BTreeSet::from([1, 2]));
+
+            rice_component_unref(component1);
+            rice_component_unref(component2);
             rice_stream_unref(stream);
             rice_agent_unref(agent);
         }

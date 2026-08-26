@@ -3,6 +3,29 @@
 pub const RICE_PROTO_MAJOR: u32 = 0;
 pub const RICE_PROTO_MINOR: u32 = 4;
 pub const RICE_PROTO_PATCH: u32 = 3;
+#[doc = " The UDP transport"]
+pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
+#[doc = " The TCP transport"]
+pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
+pub type RiceTransportType = u32;
+#[doc = " The candidate is a local network interface"]
+pub const RICE_CANDIDATE_TYPE_HOST: RiceCandidateType = 0;
+#[doc = " The candidate was discovered from incoming data"]
+pub const RICE_CANDIDATE_TYPE_PEER_REFLEXIVE: RiceCandidateType = 1;
+#[doc = " The candidate was discovered by asking an external server (STUN/TURN)"]
+pub const RICE_CANDIDATE_TYPE_SERVER_REFLEXIVE: RiceCandidateType = 2;
+#[doc = " The candidate will relay all data through an external server (TURN)."]
+pub const RICE_CANDIDATE_TYPE_RELAYED: RiceCandidateType = 3;
+pub type RiceCandidateType = u32;
+#[doc = " Not a TCP candidate."]
+pub const RICE_TCP_TYPE_NONE: RiceTcpType = 0;
+#[doc = " The candidate address will connect to a remote address."]
+pub const RICE_TCP_TYPE_ACTIVE: RiceTcpType = 1;
+#[doc = " The candidate will listen for incominng TCP connections."]
+pub const RICE_TCP_TYPE_PASSIVE: RiceTcpType = 2;
+#[doc = " Simultaneous open.  The candidate will both listen for incoming connections, and connect to\n remote addresses."]
+pub const RICE_TCP_TYPE_SO: RiceTcpType = 3;
+pub type RiceTcpType = u32;
 #[doc = " Component is in initial state and no connectivity checks are in progress."]
 pub const RICE_COMPONENT_CONNECTION_STATE_NEW: RiceComponentConnectionState = 0;
 #[doc = " Connectivity checks are in progress for this candidate"]
@@ -17,15 +40,25 @@ pub const RICE_ADDRESS_FAMILY_IPV4: RiceAddressFamily = 1;
 #[doc = " IP version 6."]
 pub const RICE_ADDRESS_FAMILY_IPV6: RiceAddressFamily = 2;
 pub type RiceAddressFamily = u32;
-#[doc = " The candidate is a local network interface"]
-pub const RICE_CANDIDATE_TYPE_HOST: RiceCandidateType = 0;
-#[doc = " The candidate was discovered from incoming data"]
-pub const RICE_CANDIDATE_TYPE_PEER_REFLEXIVE: RiceCandidateType = 1;
-#[doc = " The candidate was discovered by asking an external server (STUN/TURN)"]
-pub const RICE_CANDIDATE_TYPE_SERVER_REFLEXIVE: RiceCandidateType = 2;
-#[doc = " The candidate will relay all data through an external server (TURN)."]
-pub const RICE_CANDIDATE_TYPE_RELAYED: RiceCandidateType = 3;
-pub type RiceCandidateType = u32;
+#[doc = " The SHA-1 HMAC."]
+pub const RICE_INTEGRITY_ALGORITHM_SHA1: RiceIntegrityAlgorithm = 0;
+#[doc = " The SHA-256 HMAC."]
+pub const RICE_INTEGRITY_ALGORITHM_SHA256: RiceIntegrityAlgorithm = 1;
+pub type RiceIntegrityAlgorithm = u32;
+#[doc = " The configuration will automatically be used when supported."]
+pub const RICE_FEATURE_DISABLED: RiceFeature = -1;
+#[doc = " The configuration will automatically be used when supported."]
+pub const RICE_FEATURE_AUTO: RiceFeature = 0;
+#[doc = " The configuration is enabled and required."]
+pub const RICE_FEATURE_REQUIRED: RiceFeature = 1;
+pub type RiceFeature = i32;
+#[doc = " Openssl."]
+pub const RICE_TLS_VARIANT_OPENSSL: RiceTlsVariant = 1;
+#[doc = " Rustls."]
+pub const RICE_TLS_VARIANT_RUSTLS: RiceTlsVariant = 2;
+#[doc = " Dimpl."]
+pub const RICE_TLS_VARIANT_DIMPL: RiceTlsVariant = 3;
+pub type RiceTlsVariant = u32;
 #[doc = " Not an error. The operation was completed successfully."]
 pub const RICE_ERROR_SUCCESS: RiceError = 0;
 #[doc = " The operation failed for an unspecified reason."]
@@ -35,18 +68,6 @@ pub const RICE_ERROR_RESOURCE_NOT_FOUND: RiceError = -2;
 #[doc = " The operation is already in progress."]
 pub const RICE_ERROR_ALREADY_IN_PROGRESS: RiceError = -3;
 pub type RiceError = i32;
-#[doc = " The configuration will automatically be used when supported."]
-pub const RICE_FEATURE_DISABLED: RiceFeature = -1;
-#[doc = " The configuration will automatically be used when supported."]
-pub const RICE_FEATURE_AUTO: RiceFeature = 0;
-#[doc = " The configuration is enabled and required."]
-pub const RICE_FEATURE_REQUIRED: RiceFeature = 1;
-pub type RiceFeature = i32;
-#[doc = " The SHA-1 HMAC."]
-pub const RICE_INTEGRITY_ALGORITHM_SHA1: RiceIntegrityAlgorithm = 0;
-#[doc = " The SHA-256 HMAC."]
-pub const RICE_INTEGRITY_ALGORITHM_SHA256: RiceIntegrityAlgorithm = 1;
-pub type RiceIntegrityAlgorithm = u32;
 #[doc = " No error."]
 pub const RICE_PARSE_CANDIDATE_ERROR_SUCCESS: RiceParseCandidateError = 0;
 #[doc = " Not a candidate message."]
@@ -68,27 +89,6 @@ pub const RICE_PARSE_CANDIDATE_ERROR_BAD_EXTENSION: RiceParseCandidateError = -8
 #[doc = " Data is not well formed."]
 pub const RICE_PARSE_CANDIDATE_ERROR_MALFORMED: RiceParseCandidateError = -9;
 pub type RiceParseCandidateError = i32;
-#[doc = " Not a TCP candidate."]
-pub const RICE_TCP_TYPE_NONE: RiceTcpType = 0;
-#[doc = " The candidate address will connect to a remote address."]
-pub const RICE_TCP_TYPE_ACTIVE: RiceTcpType = 1;
-#[doc = " The candidate will listen for incominng TCP connections."]
-pub const RICE_TCP_TYPE_PASSIVE: RiceTcpType = 2;
-#[doc = " Simultaneous open.  The candidate will both listen for incoming connections, and connect to\n remote addresses."]
-pub const RICE_TCP_TYPE_SO: RiceTcpType = 3;
-pub type RiceTcpType = u32;
-#[doc = " Openssl."]
-pub const RICE_TLS_VARIANT_OPENSSL: RiceTlsVariant = 1;
-#[doc = " Rustls."]
-pub const RICE_TLS_VARIANT_RUSTLS: RiceTlsVariant = 2;
-#[doc = " Dimpl."]
-pub const RICE_TLS_VARIANT_DIMPL: RiceTlsVariant = 3;
-pub type RiceTlsVariant = u32;
-#[doc = " The UDP transport"]
-pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
-#[doc = " The TCP transport"]
-pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
-pub type RiceTransportType = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct Credentials {
@@ -621,6 +621,10 @@ unsafe extern "C" {
     pub fn rice_agent_close(agent: *const RiceAgent, now_nanos: i64);
 }
 unsafe extern "C" {
+    #[doc = " Restart every stream in the `RiceAgent` with fresh local ICE credentials."]
+    pub fn rice_agent_restart(agent: *const RiceAgent, now_nanos: i64);
+}
+unsafe extern "C" {
     #[doc = " Return the process-local unique id for this agent."]
     pub fn rice_agent_id(agent: *const RiceAgent) -> u64;
 }
@@ -962,6 +966,18 @@ unsafe extern "C" {
     );
 }
 unsafe extern "C" {
+    #[doc = " Restart this `RiceStream` with explicit local ICE credentials."]
+    pub fn rice_stream_restart_with_credentials(
+        stream: *mut RiceStream,
+        credentials: *const RiceCredentials,
+        now_nanos: i64,
+    ) -> RiceError;
+}
+unsafe extern "C" {
+    #[doc = " Restart this `RiceStream` with fresh random local ICE credentials."]
+    pub fn rice_stream_restart(stream: *mut RiceStream, now_nanos: i64) -> RiceError;
+}
+unsafe extern "C" {
     #[doc = " Construct a `RiceCandidate` from a string as formatted in an SDP and specified in RFC5245\n Section 15.1.\n\n Takes the form 'a=candidate:foundation 1 UDP 12345 127.0.0.1 23456 typ host'."]
     pub fn rice_candidate_new_from_sdp_string(
         cand_str: *const ::core::ffi::c_char,
@@ -1155,6 +1171,18 @@ unsafe extern "C" {
         stream: *const RiceStream,
         component_id: usize,
     ) -> *mut RiceComponent;
+}
+unsafe extern "C" {
+    #[doc = " Start gathering candidates for every component in a stream with the provided local socket\n addresses."]
+    pub fn rice_stream_gather_candidates(
+        stream: *mut RiceStream,
+        sockets_len: usize,
+        sockets_addr: *const *const RiceAddress,
+        sockets_transports: *const RiceTransportType,
+        turn_len: usize,
+        turn_sockets: *const *const RiceAddress,
+        turn_config: *const *mut RiceTurnConfig,
+    ) -> RiceError;
 }
 unsafe extern "C" {
     #[doc = " Start gathering candidates for a component with the provided local socket addresses.\n\n - `component`: The component to start gathering.\n - `sockets_len`: The number of entries in both `sockets_addr` and `sockets_transports`.\n - `sockets_addr`: An array of addresses for producing host and STUN server-reflexive\n   candidates.\n - `sockets_transports`: An array of transport types for producing host and STUN\n   server-reflexive candidates.\n - `turn_len`: the number of entries in both `turn_sockets` and `turn_config`.\n - `turn_sockets`: An array of local addresses for producing TURN candidates.\n - `turn_config`: An array of TURN server configurations.\n\n Candidates will be generated as follows (if they succeed):\n\n 1. A host candidate for each `(sockets_transports[i], socket_addr[i])`. If TCP, then both an\n    active and passive host candidate will be generated.\n 2. For each configured STUN server, a reflexive candidate for each\n    `(sockets_transports[i], socket_addr[i])` if different from any other candidate\n    produced. The local address for each STUN server connection will be one of the entries\n    provided in `sockets_addr`.\n 3. For each `(turn_sockets[i], turn_config[i])` a TURN allocation will be attempted and a\n    relayed candidate produced on success.  If you would like multiple options for relayed\n    candidates, e.g. UDP, TCP, TCP/TLS, then provide each options as different entries in the\n    provided array. The `turn_sockets[i]` value is the local address to communicate with the\n    TURN server in `turn_config[i]` and should be different than any value provided through\n    `sockets_addr`."]

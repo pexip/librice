@@ -162,6 +162,11 @@ impl Agent {
         unsafe { crate::ffi::rice_agent_close(self.ffi, now.as_nanos()) }
     }
 
+    /// Restart every stream in this agent with fresh per-stream local ICE credentials.
+    pub fn restart(&self, now: Instant) {
+        unsafe { crate::ffi::rice_agent_restart(self.ffi, now.as_nanos()) }
+    }
+
     /// The controlling state of this ICE agent.  This value may change throughout the ICE
     /// negotiation process.
     pub fn controlling(&self) -> bool {
@@ -778,5 +783,28 @@ mod tests {
             .consent_freshness(false)
             .build();
         let _ = agent;
+    }
+
+    #[test]
+    fn restart_all_streams() {
+        let _log = crate::tests::test_init_log();
+        let agent = Agent::builder().controlling(true).build();
+        let stream1 = agent.add_stream();
+        let stream2 = agent.add_stream();
+        let local1 = crate::stream::Credentials::new("luser1", "lpass1");
+        let local2 = crate::stream::Credentials::new("luser2", "lpass2");
+        let remote = crate::stream::Credentials::new("ruser", "rpass");
+
+        stream1.set_local_credentials(&local1);
+        stream1.set_remote_credentials(&remote);
+        stream2.set_local_credentials(&local2);
+        stream2.set_remote_credentials(&remote);
+
+        agent.restart(Instant::ZERO);
+
+        assert_ne!(stream1.local_credentials().unwrap(), local1);
+        assert!(stream1.remote_credentials().is_none());
+        assert_ne!(stream2.local_credentials().unwrap(), local2);
+        assert!(stream2.remote_credentials().is_none());
     }
 }

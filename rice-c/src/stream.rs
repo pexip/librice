@@ -134,6 +134,31 @@ impl Stream {
         }
     }
 
+    /// Restart this stream with explicit local ICE credentials.
+    pub fn restart_with_credentials(
+        &self,
+        credentials: &Credentials,
+        now: Instant,
+    ) -> Result<(), crate::agent::AgentError> {
+        unsafe {
+            crate::agent::AgentError::from_c(crate::ffi::rice_stream_restart_with_credentials(
+                self.ffi,
+                credentials.into_c_none(),
+                now.as_nanos(),
+            ))
+        }
+    }
+
+    /// Restart this stream with fresh random local ICE credentials.
+    pub fn restart(&self, now: Instant) -> Result<(), crate::agent::AgentError> {
+        unsafe {
+            crate::agent::AgentError::from_c(crate::ffi::rice_stream_restart(
+                self.ffi,
+                now.as_nanos(),
+            ))
+        }
+    }
+
     /// Signal the end of local candidates.  Calling this function may allow ICE processing to
     /// complete.
     pub fn end_of_local_candidates(&self) {
@@ -225,6 +250,39 @@ impl Stream {
             crate::ffi::rice_stream_component_ids(self.ffi, &mut len, ret.as_mut_ptr());
             ret.resize(len.min(ret.len()), 0);
             ret
+        }
+    }
+
+    /// Start gathering candidates for every component in this stream.
+    pub fn gather_candidates<'a, 'b>(
+        &self,
+        sockets: impl IntoIterator<Item = (TransportType, &'a crate::Address)>,
+        turn_servers: impl IntoIterator<Item = (&'b crate::Address, crate::turn::TurnConfig)>,
+    ) -> Result<(), crate::agent::AgentError> {
+        unsafe {
+            let mut transports = vec![];
+            let mut socket_addr = vec![];
+            let mut socket_addresses = vec![];
+            for (ttype, addr) in sockets.into_iter() {
+                transports.push(ttype.into());
+                socket_addresses.push(crate::const_override(addr.ffi));
+                socket_addr.push(addr);
+            }
+            let mut turn_sockets = vec![];
+            let mut turn_configs = vec![];
+            for (turn_addr, config) in turn_servers.into_iter() {
+                turn_sockets.push(crate::const_override(turn_addr.ffi));
+                turn_configs.push(config.into_c_full());
+            }
+            crate::agent::AgentError::from_c(crate::ffi::rice_stream_gather_candidates(
+                self.ffi,
+                transports.len(),
+                socket_addresses.as_ptr(),
+                transports.as_ptr(),
+                turn_sockets.len(),
+                turn_sockets.as_ptr(),
+                turn_configs.as_ptr(),
+            ))
         }
     }
 
@@ -430,10 +488,13 @@ impl GatheredCandidate {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use sans_io_time::Instant;
 
     use super::*;
     use crate::agent::{Agent, AgentPoll};
+    use crate::candidate::CandidateApi;
 
     #[test]
     fn getters() {
@@ -502,5 +563,57 @@ mod tests {
 
         let _ = agent.poll(Instant::ZERO);
         let _ = agent.poll(Instant::ZERO);
+    }
+
+    #[test]
+    fn restart_clears_remote_credentials() {
+        let _log = crate::tests::test_init_log();
+        let agent = Agent::builder().build();
+        let stream = agent.add_stream();
+        let local = Credentials::new("luser", "lpass");
+        let remote = Credentials::new("ruser", "rpass");
+        let restart = Credentials::new("nextuser", "nextpass");
+
+        stream.set_local_credentials(&local);
+        stream.set_remote_credentials(&remote);
+        stream
+            .restart_with_credentials(&restart, Instant::ZERO)
+            .unwrap();
+
+        assert_eq!(stream.local_credentials(), Some(restart));
+        assert!(stream.remote_credentials().is_none());
+    }
+
+    #[test]
+    fn stream_gather_candidates_all_components() {
+        let _log = crate::tests::test_init_log();
+        let addr: crate::Address = "192.168.0.1:1000".parse().unwrap();
+        let agent = Agent::builder().build();
+        let stream = agent.add_stream();
+        stream.set_local_credentials(&Credentials::new("luser", "lpass"));
+        stream.set_remote_credentials(&Credentials::new("ruser", "rpass"));
+        let _component1 = stream.add_component();
+        let _component2 = stream.add_component();
+
+        stream
+            .gather_candidates([(TransportType::Udp, &addr)], [])
+            .unwrap();
+
+        let mut gathered_components = BTreeSet::new();
+        for _ in 0..8 {
+            let mut poll = agent.poll(Instant::ZERO);
+            match &mut poll {
+                AgentPoll::GatheredCandidate(candidate) => {
+                    gathered_components.insert(candidate.gathered.candidate().component_id());
+                    stream.add_local_gathered_candidate(candidate.gathered.take());
+                }
+                AgentPoll::GatheringComplete(_) | AgentPoll::WaitUntilNanos(_) => (),
+                other => panic!("unexpected poll result: {other:?}"),
+            }
+            if gathered_components.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(gathered_components, BTreeSet::from([1, 2]));
     }
 }

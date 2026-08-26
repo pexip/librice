@@ -368,6 +368,22 @@ impl Stream {
         self.state.proto_stream.remote_credentials()
     }
 
+    /// Restart this stream with fresh random local ICE credentials.
+    pub fn restart(&self) -> Result<Credentials, AgentError> {
+        self.state
+            .proto_stream
+            .restart(Instant::from_std(self.state.base_instant))?;
+
+        if let Some(agent) = self.state.weak_agent_inner.upgrade() {
+            let mut agent = agent.lock().unwrap();
+            if let Some(waker) = agent.waker.take() {
+                waker.wake();
+            }
+        }
+
+        Ok(self.state.proto_stream.local_credentials().unwrap())
+    }
+
     /// Add a remote candidate for connection checks for use with this stream
     ///
     /// # Examples
@@ -1084,5 +1100,24 @@ mod tests {
         let remote_cands = stream.remote_candidates();
         assert_eq!(remote_cands.len(), 1);
         assert_eq!(remote_cands[0], candidate);
+    }
+
+    #[test]
+    fn restart_resets_remote_credentials() {
+        #[cfg(feature = "runtime-tokio")]
+        let _runtime = crate::tests::tokio_runtime().enter();
+        init();
+        let agent = Agent::default();
+        let stream = agent.add_stream();
+        let local = Credentials::new("luser", "lpass");
+        let remote = Credentials::new("ruser", "rpass");
+
+        stream.set_local_credentials(&local);
+        stream.set_remote_credentials(&remote);
+        let restarted = stream.restart().unwrap();
+
+        assert_ne!(restarted, local);
+        assert_eq!(stream.local_credentials(), Some(restarted));
+        assert!(stream.remote_credentials().is_none());
     }
 }
