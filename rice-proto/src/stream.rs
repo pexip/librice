@@ -36,11 +36,16 @@ use tracing::{info, trace};
 pub struct Stream<'a> {
     agent: &'a crate::agent::Agent,
     id: usize,
+    checklist_id: usize,
 }
 
 impl<'a> Stream<'a> {
-    pub(crate) fn from_agent(agent: &'a Agent, id: usize) -> Self {
-        Self { agent, id }
+    pub(crate) fn from_agent(agent: &'a Agent, id: usize, checklist_id: usize) -> Self {
+        Self {
+            agent,
+            id,
+            checklist_id,
+        }
     }
 
     /// The [`Agent`] that handles this [`Stream`].
@@ -119,11 +124,11 @@ impl<'a> Stream<'a> {
     /// let mut stream = agent.mut_stream(stream_id).unwrap();
     /// let credentials = Credentials {ufrag: "1".to_owned(), passwd: "2".to_owned()};
     /// stream.set_local_credentials(credentials.clone());
-    /// assert_eq!(stream.local_credentials(), Some(credentials));
+    /// assert_eq!(stream.local_credentials(), Some(&credentials));
     /// ```
-    pub fn local_credentials(&self) -> Option<Credentials> {
-        let stream_state = self.agent.stream_state(self.id)?;
-        stream_state.local_credentials()
+    pub fn local_credentials(&self) -> Option<&Credentials> {
+        let checklist = self.agent.checklistset.list(self.checklist_id)?;
+        Some(checklist.local_credentials())
     }
 
     /// Retreive the previouly set remote ICE credentials for this `Stream`.
@@ -138,22 +143,19 @@ impl<'a> Stream<'a> {
     /// let mut stream = agent.mut_stream(stream_id).unwrap();
     /// let credentials = Credentials {ufrag: "1".to_owned(), passwd: "2".to_owned()};
     /// stream.set_remote_credentials(credentials.clone());
-    /// assert_eq!(stream.remote_credentials(), Some(credentials));
+    /// assert_eq!(stream.remote_credentials(), Some(&credentials));
     /// ```
-    pub fn remote_credentials(&self) -> Option<Credentials> {
-        let stream_state = self.agent.stream_state(self.id)?;
-        stream_state.remote_credentials()
+    pub fn remote_credentials(&self) -> Option<&Credentials> {
+        let checklist = self.agent.checklistset.list(self.checklist_id)?;
+        checklist.remote_credentials()
     }
 
     /// Retrieve previously gathered local candidates
     pub fn local_candidates(&self) -> impl Iterator<Item = &'_ Candidate> + '_ {
-        let stream_state = self.agent.stream_state(self.id).unwrap();
-        let checklist = self
-            .agent
-            .checklistset
-            .list(stream_state.checklist_id)
-            .unwrap();
-        checklist.local_candidates()
+        let Some(checklist) = self.agent.checklistset.list(self.checklist_id) else {
+            return DualIter::Left([].iter());
+        };
+        DualIter::Right(checklist.local_candidates())
     }
 
     /// Retrieve previously set remote candidates for connection checks from this stream
@@ -183,9 +185,7 @@ impl<'a> Stream<'a> {
     /// assert_eq!(remote_cands[0], candidate);
     /// ```
     pub fn remote_candidates(&self) -> &[Candidate] {
-        let stream_state = self.agent.stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.list(checklist_id).unwrap();
+        let checklist = self.agent.checklistset.list(self.checklist_id).unwrap();
         checklist.remote_candidates()
     }
 
@@ -200,12 +200,31 @@ impl<'a> Stream<'a> {
     }
 }
 
+#[derive(Debug)]
+enum DualIter<I: core::fmt::Debug, L: Iterator<Item = I>, R: Iterator<Item = I>> {
+    Left(L),
+    Right(R),
+}
+
+impl<I: core::fmt::Debug, L: Iterator<Item = I>, R: Iterator<Item = I>> Iterator
+    for DualIter<I, L, R>
+{
+    type Item = I;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Left(l) => l.next(),
+            Self::Right(r) => r.next(),
+        }
+    }
+}
+
 /// A (mutable) ICE stream
 #[derive(Debug)]
 #[repr(C)]
 pub struct StreamMut<'a> {
     agent: &'a mut crate::agent::Agent,
     id: usize,
+    checklist_id: usize,
 }
 
 impl<'a> core::ops::Deref for StreamMut<'a> {
@@ -217,8 +236,12 @@ impl<'a> core::ops::Deref for StreamMut<'a> {
 }
 
 impl<'a> StreamMut<'a> {
-    pub(crate) fn from_agent(agent: &'a mut Agent, id: usize) -> Self {
-        Self { agent, id }
+    pub(crate) fn from_agent(agent: &'a mut Agent, id: usize, checklist_id: usize) -> Self {
+        Self {
+            agent,
+            id,
+            checklist_id,
+        }
     }
 
     /// The [`Agent`] that handles this [`Stream`].
@@ -249,8 +272,11 @@ impl<'a> StreamMut<'a> {
             .mut_stream_state(self.id)
             .ok_or(AgentError::ResourceNotFound)?;
         let component_id = stream_state.add_component()?;
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            let stream_state = self.agent.mut_stream_state(self.id).unwrap();
+            stream_state.remove_component(component_id);
+            return Err(AgentError::ResourceNotFound);
+        };
         checklist.add_component(component_id);
         Ok(component_id)
     }
@@ -283,10 +309,9 @@ impl<'a> StreamMut<'a> {
     /// stream.set_local_credentials(credentials);
     /// ```
     pub fn set_local_credentials(&mut self, credentials: Credentials) {
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        stream_state.set_local_credentials(credentials.clone());
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            return;
+        };
         checklist.set_local_credentials(credentials);
     }
 
@@ -304,10 +329,9 @@ impl<'a> StreamMut<'a> {
     /// stream.set_remote_credentials(credentials);
     /// ```
     pub fn set_remote_credentials(&mut self, credentials: Credentials) {
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        stream_state.set_remote_credentials(credentials.clone());
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            return;
+        };
         checklist.set_remote_credentials(credentials);
     }
 
@@ -342,11 +366,9 @@ impl<'a> StreamMut<'a> {
     )]
     pub fn add_remote_candidate(&mut self, cand: Candidate) {
         info!("adding remote candidate {:?}", cand);
-        let Some(stream_state) = self.agent.mut_stream_state(self.id) else {
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
             return;
         };
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
         checklist.add_remote_candidate(cand);
     }
 
@@ -406,12 +428,9 @@ impl<'a> StreamMut<'a> {
     ///
     /// Must be called after `handle_incoming_data` if `have_more_data` is `true`.
     pub fn poll_recv(&mut self) -> Option<PendingRecv> {
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
-
         self.agent
             .checklistset
-            .mut_list(checklist_id)
+            .mut_list(self.checklist_id)
             .and_then(|s| s.poll_recv())
     }
 
@@ -424,10 +443,9 @@ impl<'a> StreamMut<'a> {
         )
     )]
     pub fn end_of_remote_candidates(&mut self) {
-        // FIXME: how to deal with ice restarts?
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            return;
+        };
         checklist.end_of_remote_candidates();
     }
 
@@ -444,7 +462,6 @@ impl<'a> StreamMut<'a> {
         now: Instant,
     ) {
         let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
         let Some(component_state) = stream_state.mut_component_state(component_id) else {
             return;
         };
@@ -454,7 +471,7 @@ impl<'a> StreamMut<'a> {
             }
         }
         self.agent.checklistset.allocated_socket(
-            checklist_id,
+            self.checklist_id,
             component_id,
             transport,
             from,
@@ -468,9 +485,9 @@ impl<'a> StreamMut<'a> {
     ///
     /// Returns whether the candidate was added internally.
     pub fn add_local_candidate(&mut self, candidate: Candidate) -> bool {
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            return false;
+        };
         checklist.add_local_candidate(candidate)
     }
 
@@ -478,19 +495,30 @@ impl<'a> StreamMut<'a> {
     ///
     /// Returns whether the candidate was added internally.
     pub fn add_local_gathered_candidate(&mut self, candidate: GatheredCandidate) -> bool {
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            return false;
+        };
         checklist.add_local_gathered_candidate(candidate)
     }
 
     /// Signal the end of local candidates.  Calling this function may allow ICE processing to
     /// complete.
     pub fn end_of_local_candidates(&mut self) {
-        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
-        let checklist_id = stream_state.checklist_id;
-        let checklist = self.agent.checklistset.mut_list(checklist_id).unwrap();
+        let Some(checklist) = self.agent.checklistset.mut_list(self.checklist_id) else {
+            return;
+        };
         checklist.end_of_local_candidates()
+    }
+
+    /// Perform an ICE restart of this stream.
+    pub fn restart(&mut self, config: &RestartStreamConfig, now: Instant) {
+        if config.local_remove_candidates {
+            let Some(stream) = self.agent.mut_stream_state(self.id) else {
+                return;
+            };
+            stream.restart_gather();
+        }
+        Agent::restart_stream(&mut self.agent.checklistset, self.checklist_id, config, now);
     }
 }
 
@@ -499,8 +527,6 @@ pub(crate) struct StreamState {
     id: usize,
     pub(crate) checklist_id: usize,
     components: Vec<Option<ComponentState>>,
-    local_credentials: Option<Credentials>,
-    remote_credentials: Option<Credentials>,
 }
 
 impl StreamState {
@@ -509,8 +535,6 @@ impl StreamState {
             id,
             checklist_id,
             components: Vec::new(),
-            local_credentials: None,
-            remote_credentials: None,
         }
     }
 
@@ -572,34 +596,10 @@ impl StreamState {
         Ok(index + 1)
     }
 
-    #[tracing::instrument(
-        skip(self),
-        fields(
-            stream.id = self.id
-        )
-    )]
-    fn set_local_credentials(&mut self, credentials: Credentials) {
-        info!("setting");
-        self.local_credentials = Some(credentials.clone());
-    }
-
-    pub(crate) fn local_credentials(&self) -> Option<Credentials> {
-        self.local_credentials.clone()
-    }
-
-    #[tracing::instrument(
-        skip(self),
-        fields(
-            stream.id = self.id()
-        )
-    )]
-    fn set_remote_credentials(&mut self, credentials: Credentials) {
-        info!("setting");
-        self.remote_credentials = Some(credentials.clone());
-    }
-
-    pub(crate) fn remote_credentials(&self) -> Option<Credentials> {
-        self.remote_credentials.clone()
+    fn remove_component(&mut self, component_id: usize) {
+        debug_assert!(component_id > 0);
+        self.components.remove(component_id - 1);
+        trace!("Removed component at index {}", component_id);
     }
 
     pub(crate) fn handle_incoming_data<T: AsRef<[u8]> + core::fmt::Debug>(
@@ -697,13 +697,64 @@ impl StreamState {
             gatherer.set_request_retransmits(rto.clone());
         }
     }
+
+    pub(crate) fn restart_gather(&mut self) {
+        for component in self.components.iter_mut() {
+            let Some(component) = component else {
+                continue;
+            };
+            component.gather_state = GatherProgress::New;
+        }
+    }
+}
+
+/// Configuration for what to reset when restarting.
+#[derive(Debug, Default, Clone)]
+pub struct RestartStreamConfig {
+    pub(crate) new_local_credentials: Option<Credentials>,
+    pub(crate) local_remove_candidates: bool,
+}
+
+impl RestartStreamConfig {
+    /// Construct a new [`RestartStreamConfig`] for initiating a restart of a stream.
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Configure the local credentials to use after the ICE-restart.
+    pub fn set_new_local_credentials(mut self, credentials: Credentials) -> Self {
+        self.new_local_credentials = Some(credentials);
+        self
+    }
+
+    /// Retrieve the local credentials to use after the ICE-restart.
+    pub fn new_local_credentials(&self) -> Option<&Credentials> {
+        self.new_local_credentials.as_ref()
+    }
+
+    /// Configure whether any existing local candidates are removed or kept.
+    pub fn set_remove_local_candidates(mut self, remove: bool) -> Self {
+        self.local_remove_candidates = remove;
+        self
+    }
+
+    /// Retrieve whether any existing local candidates are removed from the agent.
+    pub fn remove_local_candidates(&self) -> bool {
+        self.local_remove_candidates
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+    use turn_client_proto::types::TurnCredentials;
+    use turn_server_proto::api::{TurnServerApi, TurnServerPollRet};
+
     use super::*;
-    use crate::agent::{Agent, AgentPoll};
+    use crate::agent::{Agent, AgentComponentStateChange, AgentPoll};
     use crate::candidate::{Candidate, CandidateType, TcpType, TransportType};
+    use crate::component::ComponentConnectionState;
+    use crate::turn::TurnConfig;
 
     #[test]
     fn getters_setters() {
@@ -719,9 +770,38 @@ mod tests {
         assert_eq!(comp_id, stream.component(comp_id).unwrap().id());
 
         stream.set_local_credentials(lcreds.clone());
-        assert_eq!(stream.local_credentials().unwrap(), lcreds);
+        assert_eq!(stream.local_credentials().unwrap(), &lcreds);
         stream.set_remote_credentials(rcreds.clone());
-        assert_eq!(stream.remote_credentials().unwrap(), rcreds);
+        assert_eq!(stream.remote_credentials().unwrap(), &rcreds);
+    }
+
+    fn gather_agent(agent: &mut Agent, mut now: Instant) -> Instant {
+        loop {
+            match agent.poll(now) {
+                AgentPoll::GatheredCandidate(gathered) => {
+                    agent
+                        .mut_stream(gathered.stream_id)
+                        .unwrap()
+                        .add_local_gathered_candidate(gathered.gathered);
+                }
+                AgentPoll::GatheringComplete(complete) => {
+                    agent
+                        .mut_stream(complete.stream_id)
+                        .unwrap()
+                        .end_of_local_candidates();
+                    break;
+                }
+                AgentPoll::WaitUntil(new_now) => {
+                    if new_now == now {
+                        break;
+                    } else {
+                        now = new_now
+                    }
+                }
+                other => panic!("unexpected poll during gathering: {other:?}"),
+            }
+        }
+        now
     }
 
     /// After local gathering completes, TCP connectivity checks still request a socket via
@@ -751,25 +831,9 @@ mod tests {
                 .unwrap();
         }
 
-        let mut gathering_done = false;
-        while !gathering_done {
-            match agent.poll(now) {
-                AgentPoll::GatheredCandidate(gathered) => {
-                    agent
-                        .mut_stream(stream_id)
-                        .unwrap()
-                        .add_local_gathered_candidate(gathered.gathered);
-                }
-                AgentPoll::GatheringComplete(complete) => {
-                    assert_eq!(complete.component_id, component_id);
-                    agent
-                        .mut_stream(stream_id)
-                        .unwrap()
-                        .end_of_local_candidates();
-                    gathering_done = true;
-                }
-                other => panic!("unexpected poll during gathering: {other:?}"),
-            }
+        {
+            let new_now = gather_agent(&mut agent, now);
+            assert_eq!(new_now, now, "Unexpected wait produced");
         }
 
         let remote_addr: SocketAddr = "192.168.1.2:2000".parse().unwrap();
@@ -808,9 +872,279 @@ mod tests {
             now,
         );
 
+        let AgentPoll::ComponentStateChange(AgentComponentStateChange {
+            stream_id: recv_stream_id,
+            component_id: recv_component_id,
+            state,
+        }) = agent.poll(now)
+        else {
+            unreachable!()
+        };
+        assert_eq!(recv_stream_id, stream_id);
+        assert_eq!(recv_component_id, component_id);
+        assert_eq!(state, ComponentConnectionState::Connecting);
+
+        let AgentPoll::WaitUntil(_now) = agent.poll(now) else {
+            unreachable!();
+        };
+
         assert!(
             agent.poll_transmit(now).is_some(),
             "checklist should emit STUN after allocated_socket"
         );
+    }
+
+    #[test]
+    fn stream_restart_keep_local_gather_fails() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let local_bind: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+
+        let mut agent = Agent::default();
+        let stream_id = agent.add_stream();
+        let component_id = agent
+            .mut_stream(stream_id)
+            .unwrap()
+            .add_component()
+            .unwrap();
+        {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            stream.set_local_credentials(Credentials::new("luser".into(), "lpass".into()));
+            stream.set_remote_credentials(Credentials::new("ruser".into(), "rpass".into()));
+            stream
+                .mut_component(component_id)
+                .unwrap()
+                .gather_candidates(&[(TransportType::Udp, local_bind)], &[], &[])
+                .unwrap();
+        }
+
+        let now = gather_agent(&mut agent, now);
+
+        let mut stream = agent.mut_stream(stream_id).unwrap();
+        stream.restart(
+            &RestartStreamConfig::new().set_remove_local_candidates(false),
+            now,
+        );
+        assert!(matches!(
+            stream
+                .mut_component(component_id)
+                .unwrap()
+                .gather_candidates(&[(TransportType::Udp, local_bind)], &[], &[]),
+            Err(AgentError::AlreadyInProgress)
+        ));
+    }
+
+    #[test]
+    fn stream_restart_remove_local_regather() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let local_bind: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+
+        let mut agent = Agent::default();
+        let stream_id = agent.add_stream();
+        let component_id = agent
+            .mut_stream(stream_id)
+            .unwrap()
+            .add_component()
+            .unwrap();
+        {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            stream.set_local_credentials(Credentials::new("luser".into(), "lpass".into()));
+            stream.set_remote_credentials(Credentials::new("ruser".into(), "rpass".into()));
+            stream
+                .mut_component(component_id)
+                .unwrap()
+                .gather_candidates(&[(TransportType::Udp, local_bind)], &[], &[])
+                .unwrap();
+        }
+
+        let now = gather_agent(&mut agent, now);
+
+        let mut stream = agent.mut_stream(stream_id).unwrap();
+        stream.restart(
+            &RestartStreamConfig::new().set_remove_local_candidates(true),
+            now,
+        );
+        stream
+            .mut_component(component_id)
+            .unwrap()
+            .gather_candidates(&[(TransportType::Udp, local_bind)], &[], &[])
+            .unwrap();
+
+        gather_agent(&mut agent, now);
+    }
+
+    fn gather_turn(
+        agent: &mut Agent,
+        stream_id: usize,
+        component_id: usize,
+        turn_server: &mut turn_server_proto::server::TurnServer,
+        from: SocketAddr,
+        alloc_addr: SocketAddr,
+        now: Instant,
+    ) -> Instant {
+        // unauthenticated TURN ALLOCATE
+        let AgentPoll::WaitUntil(new_now) = agent.poll(now) else {
+            unreachable!();
+        };
+        let listen_addr = turn_server.listen_address();
+        assert_eq!(new_now, now);
+        let turn_transmit = agent.poll_transmit(now).unwrap();
+        assert_eq!(turn_transmit.transmit.from, from);
+        assert_eq!(turn_transmit.transmit.to, listen_addr);
+        let reply = turn_server
+            .recv(turn_transmit.transmit, now)
+            .unwrap()
+            .build();
+        let mut stream = agent.mut_stream(stream_id).unwrap();
+        let ret = stream.handle_incoming_data(component_id, reply, now);
+        assert!(ret.handled());
+
+        let AgentPoll::WaitUntil(now) = agent.poll(now) else {
+            unreachable!();
+        };
+
+        // authenticated TURN ALLOCATE
+        let turn_transmit = agent.poll_transmit(now).unwrap();
+        assert_eq!(turn_transmit.transmit.from, from);
+        assert_eq!(turn_transmit.transmit.to, listen_addr);
+        assert!(turn_server.recv(turn_transmit.transmit, now).is_none());
+
+        let TurnServerPollRet::AllocateSocket {
+            transport,
+            listen_addr,
+            client_addr,
+            allocation_transport,
+            family,
+        } = turn_server.poll(now)
+        else {
+            unreachable!();
+        };
+        turn_server.allocated_socket(
+            transport,
+            listen_addr,
+            client_addr,
+            allocation_transport,
+            family,
+            Ok(alloc_addr),
+            now,
+        );
+        let reply = turn_server.poll_transmit(now).unwrap();
+
+        let mut stream = agent.mut_stream(stream_id).unwrap();
+        let ret = stream.handle_incoming_data(component_id, reply, now);
+        assert!(ret.handled());
+        now
+    }
+
+    #[test]
+    fn stream_restart_turn() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let local_bind: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+        let turn_listen_addr = "10.0.2.2:3478".parse().unwrap();
+        let turn_alloc_addr = "10.0.2.2:55555".parse().unwrap();
+        let turn_credentials = TurnCredentials::new("tuser", "tpass");
+        let config = TurnConfig::new(
+            TransportType::Udp,
+            turn_listen_addr,
+            turn_credentials.clone(),
+        );
+        let mut turn_server = turn_server_proto::server::TurnServer::new(
+            TransportType::Udp,
+            turn_listen_addr,
+            "realm".to_string(),
+        );
+        turn_server.add_user(
+            turn_credentials.username().to_string(),
+            turn_credentials.password().to_string(),
+        );
+
+        let mut agent = Agent::default();
+        let stream_id = agent.add_stream();
+        let component_id = agent
+            .mut_stream(stream_id)
+            .unwrap()
+            .add_component()
+            .unwrap();
+        {
+            let mut stream = agent.mut_stream(stream_id).unwrap();
+            stream.set_local_credentials(Credentials::new("luser".into(), "lpass".into()));
+            stream.set_remote_credentials(Credentials::new("ruser".into(), "rpass".into()));
+            stream
+                .mut_component(component_id)
+                .unwrap()
+                .gather_candidates(&[], &[], &[(local_bind, &config)])
+                .unwrap();
+        }
+
+        let now = gather_turn(
+            &mut agent,
+            stream_id,
+            component_id,
+            &mut turn_server,
+            local_bind,
+            turn_alloc_addr,
+            now,
+        );
+
+        let AgentPoll::GatheredCandidate(gathered) = agent.poll(now) else {
+            unreachable!();
+        };
+        assert_eq!(
+            gathered.gathered.candidate.candidate_type,
+            CandidateType::Relayed
+        );
+        assert!(gathered.gathered.turn_agent.is_some());
+        agent
+            .mut_stream(gathered.stream_id)
+            .unwrap()
+            .add_local_gathered_candidate(gathered.gathered);
+        let AgentPoll::GatheringComplete(complete) = agent.poll(now) else {
+            unreachable!();
+        };
+        assert_eq!(complete.stream_id, stream_id);
+        assert_eq!(complete.component_id, component_id);
+
+        let mut stream = agent.mut_stream(stream_id).unwrap();
+        stream.restart(
+            &RestartStreamConfig::new().set_remove_local_candidates(true),
+            now,
+        );
+        let local_bind = "192.168.1.1:2000".parse().unwrap();
+        let turn_alloc_addr = "10.0.2.2:44444".parse().unwrap();
+        stream
+            .mut_component(component_id)
+            .unwrap()
+            .gather_candidates(&[], &[], &[(local_bind, &config)])
+            .unwrap();
+
+        let now = gather_turn(
+            &mut agent,
+            stream_id,
+            component_id,
+            &mut turn_server,
+            local_bind,
+            turn_alloc_addr,
+            now,
+        );
+
+        let AgentPoll::GatheredCandidate(gathered) = agent.poll(now) else {
+            unreachable!();
+        };
+        assert_eq!(
+            gathered.gathered.candidate.candidate_type,
+            CandidateType::Relayed
+        );
+        assert!(gathered.gathered.turn_agent.is_some());
+        agent
+            .mut_stream(gathered.stream_id)
+            .unwrap()
+            .add_local_gathered_candidate(gathered.gathered);
+        let AgentPoll::GatheringComplete(complete) = agent.poll(now) else {
+            unreachable!();
+        };
+        assert_eq!(complete.stream_id, stream_id);
+        assert_eq!(complete.component_id, component_id);
     }
 }

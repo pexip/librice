@@ -30,12 +30,14 @@ use crate::conncheck::{
 use crate::consent::{self, ConsentFreshness, ConsentFreshnessPoll};
 use crate::gathering::{GatherPoll, GatheredCandidate};
 use crate::rand::rand_u64;
-use crate::stream::{Stream, StreamMut, StreamState};
+use crate::stream::{RestartStreamConfig, Stream, StreamMut, StreamState};
 use crate::turn::TurnConfig;
 use stun_proto::agent::{StunError, Transmit};
 use stun_proto::types::message::StunParseError;
 
 use tracing::{info, warn};
+
+pub use crate::restart::{RestartConfig, RoleChange};
 
 /// Errors that can be returned as a result of agent operations.
 #[derive(Debug)]
@@ -333,6 +335,36 @@ impl Agent {
         self.checklistset.set_request_retransmits(rto);
     }
 
+    /// Perform an ICE-restart.
+    pub fn restart(&mut self, config: &RestartConfig, now: Instant) {
+        match config.local_role_change {
+            RoleChange::None => (),
+            RoleChange::Lite => self.checklistset.set_ice_lite(true),
+            RoleChange::Full => self.checklistset.set_ice_lite(false),
+        }
+
+        let stream_config = RestartStreamConfig::new()
+            .set_remove_local_candidates(config.remove_local_candidates());
+        for stream in self.streams.iter_mut() {
+            if config.local_remove_candidates {
+                stream.restart_gather();
+            }
+            let checklist_id = stream.checklist_id;
+            Self::restart_stream(&mut self.checklistset, checklist_id, &stream_config, now);
+        }
+    }
+
+    pub(crate) fn restart_stream(
+        checklistset: &mut ConnCheckListSet,
+        checklist_id: usize,
+        config: &RestartStreamConfig,
+        now: Instant,
+    ) {
+        let checklist = checklistset.mut_list(checklist_id).unwrap();
+        let checks = checklist.restart(config);
+        checklistset.remove_checks(checklist_id, checks, now);
+    }
+
     /// Update the controlling state of the agent based on external factors.
     pub fn set_controlling(&mut self, controlling: bool) {
         self.checklistset.set_controlling(controlling);
@@ -437,8 +469,9 @@ impl Agent {
     ///
     /// If the stream does not exist, then `None` will be returned.
     pub fn stream(&self, id: usize) -> Option<crate::stream::Stream<'_>> {
-        if self.streams.get(id).is_some() {
-            Some(Stream::from_agent(self, id))
+        if let Some(stream) = self.streams.get(id) {
+            let checklist_id = stream.checklist_id;
+            Some(Stream::from_agent(self, id, checklist_id))
         } else {
             None
         }
@@ -450,8 +483,9 @@ impl Agent {
 
     /// Get a [`StreamMut`] by id.  If the stream does not exist, then `None` will be returned.
     pub fn mut_stream(&mut self, id: usize) -> Option<StreamMut<'_>> {
-        if self.streams.get_mut(id).is_some() {
-            Some(StreamMut::from_agent(self, id))
+        if let Some(stream) = self.streams.get_mut(id) {
+            let checklist_id = stream.checklist_id;
+            Some(StreamMut::from_agent(self, id, checklist_id))
         } else {
             None
         }
@@ -606,29 +640,25 @@ impl Agent {
                     {
                         if stream.component_state(cid).is_some() {
                             if !self.checklistset.ice_lite() {
-                                if let Some(cf) = &mut self.consent_freshness {
-                                    let pair = selected.candidate_pair();
+                                if let Some(checklist) = self.checklistset.list(checklist_id) {
+                                    if let Some(cf) = &mut self.consent_freshness {
+                                        if let Some(remote_credentials) =
+                                            checklist.remote_credentials()
+                                        {
+                                            let pair = selected.candidate_pair();
 
-                                    if let (Some(local_creds), Some(remote_creds)) =
-                                        (stream.local_credentials(), stream.remote_credentials())
-                                    {
-                                        cf.start(
-                                            stream.id(),
-                                            cid,
-                                            pair.local.clone(),
-                                            pair.remote.address,
-                                            local_creds,
-                                            remote_creds,
-                                            self.checklistset.controlling(),
-                                            self.checklistset.tie_breaker(),
-                                            now,
-                                        );
-                                    } else {
-                                        warn!(
-                                            "missing credentials for stream {}, component {}",
-                                            stream.id(),
-                                            cid
-                                        );
+                                            cf.start(
+                                                stream.id(),
+                                                cid,
+                                                pair.local.clone(),
+                                                pair.remote.address,
+                                                checklist.local_credentials().clone(),
+                                                remote_credentials.clone(),
+                                                self.checklistset.controlling(),
+                                                self.checklistset.tie_breaker(),
+                                                now,
+                                            );
+                                        }
                                     }
                                 }
                             }
