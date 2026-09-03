@@ -52,9 +52,9 @@ impl TcpBuffer {
         }
 
         let data_length = BigEndian::read_u16(&self.buf[..2]) as usize;
-        if self.buf.len() < data_length {
+        if self.buf.len() < data_length + 2 {
             trace!(
-                "not enough data, buf length {} data specifies length {}",
+                "not enough data, buf length {} data specifies length {} (+2 bytes of framing)",
                 self.buf.len(),
                 data_length
             );
@@ -107,5 +107,47 @@ mod tests {
         assert!(tcp_buffer.pull_data().is_none());
         tcp_buffer.push_data(&data);
         assert_eq!(tcp_buffer.pull_data().unwrap(), &data);
+    }
+
+    #[test]
+    fn tcp_buffer_split_recv_partial_data() {
+        let _log = crate::tests::test_init_log();
+
+        let mut tcp_buffer = TcpBuffer::default();
+
+        let mut len = [0; 2];
+        let data = [0, 1, 2, 4, 3];
+        BigEndian::write_u16(&mut len, data.len() as u16);
+
+        tcp_buffer.push_data(&len);
+        // the buffer holds the length prefix and only part of the data.  Nothing can be returned
+        // until the entire data has been received.
+        tcp_buffer.push_data(&data[..3]);
+        assert!(tcp_buffer.pull_data().is_none());
+        tcp_buffer.push_data(&data[3..]);
+        assert_eq!(tcp_buffer.pull_data().unwrap(), &data);
+        assert!(tcp_buffer.pull_data().is_none());
+    }
+
+    #[test]
+    fn tcp_buffer_recv_multiple_with_partial_data() {
+        let _log = crate::tests::test_init_log();
+
+        let mut tcp_buffer = TcpBuffer::default();
+
+        let mut len = [0; 2];
+        let data = [0, 1, 2, 4, 3];
+        BigEndian::write_u16(&mut len, data.len() as u16);
+
+        // a complete piece of data followed by an incomplete one.
+        tcp_buffer.push_data(&len);
+        tcp_buffer.push_data(&data);
+        tcp_buffer.push_data(&len);
+        tcp_buffer.push_data(&data[..2]);
+        assert_eq!(tcp_buffer.pull_data().unwrap(), &data);
+        assert!(tcp_buffer.pull_data().is_none());
+        tcp_buffer.push_data(&data[2..]);
+        assert_eq!(tcp_buffer.pull_data().unwrap(), &data);
+        assert!(tcp_buffer.pull_data().is_none());
     }
 }

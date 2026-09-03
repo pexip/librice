@@ -3,6 +3,29 @@
 pub const RICE_PROTO_MAJOR: u32 = 0;
 pub const RICE_PROTO_MINOR: u32 = 4;
 pub const RICE_PROTO_PATCH: u32 = 3;
+#[doc = " The UDP transport"]
+pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
+#[doc = " The TCP transport"]
+pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
+pub type RiceTransportType = u32;
+#[doc = " The candidate is a local network interface"]
+pub const RICE_CANDIDATE_TYPE_HOST: RiceCandidateType = 0;
+#[doc = " The candidate was discovered from incoming data"]
+pub const RICE_CANDIDATE_TYPE_PEER_REFLEXIVE: RiceCandidateType = 1;
+#[doc = " The candidate was discovered by asking an external server (STUN/TURN)"]
+pub const RICE_CANDIDATE_TYPE_SERVER_REFLEXIVE: RiceCandidateType = 2;
+#[doc = " The candidate will relay all data through an external server (TURN)."]
+pub const RICE_CANDIDATE_TYPE_RELAYED: RiceCandidateType = 3;
+pub type RiceCandidateType = u32;
+#[doc = " Not a TCP candidate."]
+pub const RICE_TCP_TYPE_NONE: RiceTcpType = 0;
+#[doc = " The candidate address will connect to a remote address."]
+pub const RICE_TCP_TYPE_ACTIVE: RiceTcpType = 1;
+#[doc = " The candidate will listen for incominng TCP connections."]
+pub const RICE_TCP_TYPE_PASSIVE: RiceTcpType = 2;
+#[doc = " Simultaneous open.  The candidate will both listen for incoming connections, and connect to\n remote addresses."]
+pub const RICE_TCP_TYPE_SO: RiceTcpType = 3;
+pub type RiceTcpType = u32;
 #[doc = " Component is in initial state and no connectivity checks are in progress."]
 pub const RICE_COMPONENT_CONNECTION_STATE_NEW: RiceComponentConnectionState = 0;
 #[doc = " Connectivity checks are in progress for this candidate"]
@@ -17,24 +40,11 @@ pub const RICE_ADDRESS_FAMILY_IPV4: RiceAddressFamily = 1;
 #[doc = " IP version 6."]
 pub const RICE_ADDRESS_FAMILY_IPV6: RiceAddressFamily = 2;
 pub type RiceAddressFamily = u32;
-#[doc = " The candidate is a local network interface"]
-pub const RICE_CANDIDATE_TYPE_HOST: RiceCandidateType = 0;
-#[doc = " The candidate was discovered from incoming data"]
-pub const RICE_CANDIDATE_TYPE_PEER_REFLEXIVE: RiceCandidateType = 1;
-#[doc = " The candidate was discovered by asking an external server (STUN/TURN)"]
-pub const RICE_CANDIDATE_TYPE_SERVER_REFLEXIVE: RiceCandidateType = 2;
-#[doc = " The candidate will relay all data through an external server (TURN)."]
-pub const RICE_CANDIDATE_TYPE_RELAYED: RiceCandidateType = 3;
-pub type RiceCandidateType = u32;
-#[doc = " Not an error. The operation was completed successfully."]
-pub const RICE_ERROR_SUCCESS: RiceError = 0;
-#[doc = " The operation failed for an unspecified reason."]
-pub const RICE_ERROR_FAILED: RiceError = -1;
-#[doc = " A required resource was not found."]
-pub const RICE_ERROR_RESOURCE_NOT_FOUND: RiceError = -2;
-#[doc = " The operation is already in progress."]
-pub const RICE_ERROR_ALREADY_IN_PROGRESS: RiceError = -3;
-pub type RiceError = i32;
+#[doc = " The SHA-1 HMAC."]
+pub const RICE_INTEGRITY_ALGORITHM_SHA1: RiceIntegrityAlgorithm = 0;
+#[doc = " The SHA-256 HMAC."]
+pub const RICE_INTEGRITY_ALGORITHM_SHA256: RiceIntegrityAlgorithm = 1;
+pub type RiceIntegrityAlgorithm = u32;
 #[doc = " The configuration will not be used."]
 pub const RICE_FEATURE_DISABLED: RiceFeature = -1;
 #[doc = " The configuration will automatically be used when supported."]
@@ -42,11 +52,20 @@ pub const RICE_FEATURE_AUTO: RiceFeature = 0;
 #[doc = " The configuration is enabled and required."]
 pub const RICE_FEATURE_REQUIRED: RiceFeature = 1;
 pub type RiceFeature = i32;
-#[doc = " The SHA-1 HMAC."]
-pub const RICE_INTEGRITY_ALGORITHM_SHA1: RiceIntegrityAlgorithm = 0;
-#[doc = " The SHA-256 HMAC."]
-pub const RICE_INTEGRITY_ALGORITHM_SHA256: RiceIntegrityAlgorithm = 1;
-pub type RiceIntegrityAlgorithm = u32;
+#[doc = " Openssl."]
+pub const RICE_TLS_VARIANT_OPENSSL: RiceTlsVariant = 1;
+#[doc = " Rustls."]
+pub const RICE_TLS_VARIANT_RUSTLS: RiceTlsVariant = 2;
+#[doc = " Dimpl."]
+pub const RICE_TLS_VARIANT_DIMPL: RiceTlsVariant = 3;
+pub type RiceTlsVariant = u32;
+#[doc = " No role change."]
+pub const RICE_ROLE_CHANGE_NONE: RiceRoleChange = 0;
+#[doc = " Change role to Lite."]
+pub const RICE_ROLE_CHANGE_LITE: RiceRoleChange = 1;
+#[doc = " Change role to Full."]
+pub const RICE_ROLE_CHANGE_FULL: RiceRoleChange = 2;
+pub type RiceRoleChange = i32;
 #[doc = " No error."]
 pub const RICE_PARSE_CANDIDATE_ERROR_SUCCESS: RiceParseCandidateError = 0;
 #[doc = " Not a candidate message."]
@@ -68,27 +87,15 @@ pub const RICE_PARSE_CANDIDATE_ERROR_BAD_EXTENSION: RiceParseCandidateError = -8
 #[doc = " Data is not well formed."]
 pub const RICE_PARSE_CANDIDATE_ERROR_MALFORMED: RiceParseCandidateError = -9;
 pub type RiceParseCandidateError = i32;
-#[doc = " Not a TCP candidate."]
-pub const RICE_TCP_TYPE_NONE: RiceTcpType = 0;
-#[doc = " The candidate address will connect to a remote address."]
-pub const RICE_TCP_TYPE_ACTIVE: RiceTcpType = 1;
-#[doc = " The candidate will listen for incominng TCP connections."]
-pub const RICE_TCP_TYPE_PASSIVE: RiceTcpType = 2;
-#[doc = " Simultaneous open.  The candidate will both listen for incoming connections, and connect to\n remote addresses."]
-pub const RICE_TCP_TYPE_SO: RiceTcpType = 3;
-pub type RiceTcpType = u32;
-#[doc = " Openssl."]
-pub const RICE_TLS_VARIANT_OPENSSL: RiceTlsVariant = 1;
-#[doc = " Rustls."]
-pub const RICE_TLS_VARIANT_RUSTLS: RiceTlsVariant = 2;
-#[doc = " Dimpl."]
-pub const RICE_TLS_VARIANT_DIMPL: RiceTlsVariant = 3;
-pub type RiceTlsVariant = u32;
-#[doc = " The UDP transport"]
-pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
-#[doc = " The TCP transport"]
-pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
-pub type RiceTransportType = u32;
+#[doc = " Not an error. The operation was completed successfully."]
+pub const RICE_ERROR_SUCCESS: RiceError = 0;
+#[doc = " The operation failed for an unspecified reason."]
+pub const RICE_ERROR_FAILED: RiceError = -1;
+#[doc = " A required resource was not found."]
+pub const RICE_ERROR_RESOURCE_NOT_FOUND: RiceError = -2;
+#[doc = " The operation is already in progress."]
+pub const RICE_ERROR_ALREADY_IN_PROGRESS: RiceError = -3;
+pub type RiceError = i32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct Credentials {
@@ -111,7 +118,17 @@ pub struct RiceComponent {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct RiceRestartConfig {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct RiceStream {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RiceStreamRestartConfig {
     _unused: [u8; 0],
 }
 #[repr(C)]
@@ -863,6 +880,52 @@ unsafe extern "C" {
     pub fn rice_tls_config_new_dimpl() -> *mut RiceTlsConfig;
 }
 unsafe extern "C" {
+    #[doc = " Create a new [`RiceStreamRestartConfig`]."]
+    pub fn rice_restart_config_new() -> *mut RiceRestartConfig;
+}
+unsafe extern "C" {
+    #[doc = " Copy a [`RiceRestartConfig`]."]
+    pub fn rice_restart_config_copy(config: *const RiceRestartConfig) -> *mut RiceRestartConfig;
+}
+unsafe extern "C" {
+    #[doc = " Free a [`RiceRestartConfig`]."]
+    pub fn rice_restart_config_free(config: *mut RiceRestartConfig);
+}
+unsafe extern "C" {
+    #[doc = " Configure whether any existing local candidates are removed or kept."]
+    pub fn rice_restart_config_set_remove_local_candidates(
+        config: *mut RiceRestartConfig,
+        remove: bool,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Retrieve whether any existing local candidates are removed or kept."]
+    pub fn rice_restart_config_get_remove_local_candidates(
+        config: *const RiceRestartConfig,
+    ) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " We are changing roles to the specified role."]
+    pub fn rice_restart_config_set_local_role_change(
+        config: *mut RiceRestartConfig,
+        role: RiceRoleChange,
+    );
+}
+unsafe extern "C" {
+    #[doc = " We are changing roles to the specified role."]
+    pub fn rice_restart_config_get_local_role_change(
+        config: *mut RiceRestartConfig,
+    ) -> RiceRoleChange;
+}
+unsafe extern "C" {
+    #[doc = " Restart a stream with the provided configuration."]
+    pub fn rice_agent_restart(
+        agent: *mut RiceAgent,
+        config: *const RiceRestartConfig,
+        now_nanos: i64,
+    );
+}
+unsafe extern "C" {
     #[doc = " Add an ICE stream to the `RiceAgent`."]
     pub fn rice_agent_add_stream(agent: *mut RiceAgent) -> *mut RiceStream;
 }
@@ -1122,6 +1185,54 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Return the component ids currently in use by a `RiceStream`.\n\n `ret` can be NULL to discover the length of the data that would be provided."]
     pub fn rice_stream_component_ids(stream: *mut RiceStream, len: *mut usize, ret: *mut usize);
+}
+unsafe extern "C" {
+    #[doc = " Create a new [`RiceStreamRestartConfig`]."]
+    pub fn rice_stream_restart_config_new() -> *mut RiceStreamRestartConfig;
+}
+unsafe extern "C" {
+    #[doc = " Copy a [`RiceStreamRestartConfig`]."]
+    pub fn rice_stream_restart_config_copy(
+        config: *const RiceStreamRestartConfig,
+    ) -> *mut RiceStreamRestartConfig;
+}
+unsafe extern "C" {
+    #[doc = " Free a [`RiceStreamRestartConfig`]."]
+    pub fn rice_stream_restart_config_free(config: *mut RiceStreamRestartConfig);
+}
+unsafe extern "C" {
+    #[doc = " Configure the local credentials to use after the ICE-restart."]
+    pub fn rice_stream_restart_config_set_new_local_credentials(
+        config: *mut RiceStreamRestartConfig,
+        creds: *const RiceCredentials,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Retrieve the local credentials to use after the ICE-restart."]
+    pub fn rice_stream_restart_config_get_new_local_credentials(
+        config: *const RiceStreamRestartConfig,
+    ) -> *mut RiceCredentials;
+}
+unsafe extern "C" {
+    #[doc = " Configure whether any existing local candidates are removed or kept."]
+    pub fn rice_stream_restart_config_set_remove_local_candidates(
+        config: *mut RiceStreamRestartConfig,
+        remove: bool,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Configure whether any existing local candidates are removed or kept."]
+    pub fn rice_stream_restart_config_get_remove_local_candidates(
+        config: *const RiceStreamRestartConfig,
+    ) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Restart a stream with the provided configuration."]
+    pub fn rice_stream_restart(
+        stream: *mut RiceStream,
+        config: *const RiceStreamRestartConfig,
+        now_nanos: i64,
+    );
 }
 unsafe extern "C" {
     #[doc = " Add an ICE component to a `RiceStream`."]
