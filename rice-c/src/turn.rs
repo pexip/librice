@@ -297,6 +297,20 @@ impl TurnTlsConfig {
         unsafe { Self::Openssl(crate::ffi::rice_tls_config_new_openssl(transport.into())) }
     }
 
+    /// Construct a new client OpenSSL TLS configuration with the specified transport that also
+    /// validates that the server's certificate was produced for the provided ip.
+    ///
+    /// Only the IP address part of `addr` is used, the port is ignored.
+    #[cfg(feature = "openssl")]
+    pub fn new_openssl_with_ip(transport: TransportType, addr: &crate::Address) -> Self {
+        unsafe {
+            Self::Openssl(crate::ffi::rice_tls_config_new_openssl_with_ip(
+                transport.into(),
+                addr.as_c(),
+            ))
+        }
+    }
+
     /// Construct a new client `dimpl` TLS configuration.
     #[cfg(feature = "dimpl")]
     pub fn new_dimpl() -> Self {
@@ -409,6 +423,22 @@ mod tests {
         #[test]
         fn test_openssl_roundtrip() {
             let _cfg = TurnTlsConfig::new_openssl(TransportType::Udp);
+        }
+
+        #[test]
+        fn test_openssl_with_ip_roundtrip() {
+            let addr = "127.0.0.1:3478".parse::<SocketAddr>().unwrap();
+            for transport in [TransportType::Udp, TransportType::Tcp] {
+                let cfg = TurnTlsConfig::new_openssl_with_ip(transport, &addr.into());
+                let cloned = cfg.clone();
+                drop(cfg);
+                let mut config =
+                    TurnConfig::new(transport, turn_server_address(), turn_credentials());
+                config.set_tls_config(cloned.clone());
+                drop(cloned);
+                let retrieved = config.tls_config().unwrap();
+                assert!(matches!(retrieved, TurnTlsConfig::Openssl(_)));
+            }
         }
 
         #[test]

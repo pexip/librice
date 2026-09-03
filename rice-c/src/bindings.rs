@@ -845,8 +845,15 @@ unsafe extern "C" {
     pub fn rice_tls_config_variant(config: *const RiceTlsConfig) -> RiceTlsVariant;
 }
 unsafe extern "C" {
-    #[doc = " Construct a new TLS configuration using Openssl."]
+    #[doc = " Construct a new TLS configuration using Openssl.\n\n The returned configuration validates the certificate chain of the TURN server but performs no\n hostname or IP address identity check.  Any certificate that is valid for any host will be\n accepted.  Use `rice_tls_config_new_openssl_with_ip()` to also validate that the certificate\n was produced for a particular IP address."]
     pub fn rice_tls_config_new_openssl(transport: RiceTransportType) -> *mut RiceTlsConfig;
+}
+unsafe extern "C" {
+    #[doc = " Construct a new TLS configuration using Openssl that validates that the TURN server's\n certificate was produced for the provided IP address.\n\n Only the IP address part of `addr` is used, the port is ignored.\n\n The `addr` is only borrowed and remains owned by the caller."]
+    pub fn rice_tls_config_new_openssl_with_ip(
+        transport: RiceTransportType,
+        addr: *const RiceAddress,
+    ) -> *mut RiceTlsConfig;
 }
 unsafe extern "C" {
     #[doc = " Construct a new TLS configuration using Rustls."]
