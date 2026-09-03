@@ -1175,14 +1175,15 @@ pub unsafe extern "C" fn rice_turn_config_get_address_families(
             *n_families = config.inner().address_families().len();
         } else if *n_families > 0 {
             let families = core::slice::from_raw_parts_mut(families, *n_families);
-            *n_families = 0;
-            for family in config.inner().address_families() {
-                families[*n_families] = RiceAddressFamily::from_rice(*family);
-                if *n_families + 1 > families.len() {
-                    break;
-                }
-                *n_families += 1;
+            let mut n_written = 0;
+            for (out, family) in families
+                .iter_mut()
+                .zip(config.inner().address_families().iter())
+            {
+                *out = RiceAddressFamily::from_rice(*family);
+                n_written += 1;
             }
+            *n_families = n_written;
         }
         core::mem::forget(config);
     }
@@ -1312,14 +1313,15 @@ pub unsafe extern "C" fn rice_turn_config_get_supported_integrity(
             *n_integrities = config.inner().supported_integrity().len();
         } else if *n_integrities > 0 {
             let integrities = core::slice::from_raw_parts_mut(integrities, *n_integrities);
-            *n_integrities = 0;
-            for integrity in config.inner().supported_integrity() {
-                integrities[*n_integrities] = RiceIntegrityAlgorithm::from(*integrity);
-                if *n_integrities + 1 > integrities.len() {
-                    break;
-                }
-                *n_integrities += 1;
+            let mut n_written = 0;
+            for (out, integrity) in integrities
+                .iter_mut()
+                .zip(config.inner().supported_integrity().iter())
+            {
+                *out = RiceIntegrityAlgorithm::from(*integrity);
+                n_written += 1;
             }
+            *n_integrities = n_written;
         }
         core::mem::forget(config);
     }
@@ -2613,6 +2615,10 @@ pub unsafe extern "C" fn rice_stream_end_of_local_candidates(stream: *mut RiceSt
 }
 
 /// Retrieve previously set local candidates for connection checks from this stream.
+///
+/// `candidates` can be NULL to discover the number of candidates available.  Otherwise,
+/// `n_candidates` must contain the number of `RiceCandidate`s that `candidates` can hold and will
+/// be set to the number of `RiceCandidate`s that have been written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rice_stream_get_local_candidates(
     stream: *mut RiceStream,
@@ -2627,14 +2633,12 @@ pub unsafe extern "C" fn rice_stream_get_local_candidates(
             *n_candidates = proto_stream.local_candidates().count();
         } else if *n_candidates > 0 {
             let candidates = core::slice::from_raw_parts_mut(candidates, *n_candidates);
-            *n_candidates = 0;
-            for candidate in proto_stream.local_candidates() {
-                candidates[*n_candidates] = RiceCandidate::into_c_full(candidate.clone());
-                if *n_candidates + 1 > candidates.len() {
-                    break;
-                }
-                *n_candidates += 1;
+            let mut n_written = 0;
+            for (out, candidate) in candidates.iter_mut().zip(proto_stream.local_candidates()) {
+                *out = RiceCandidate::into_c_full(candidate.clone());
+                n_written += 1;
             }
+            *n_candidates = n_written;
         }
 
         drop(proto_agent);
@@ -2659,6 +2663,10 @@ pub unsafe extern "C" fn rice_stream_end_of_remote_candidates(stream: *mut RiceS
 }
 
 /// Retrieve previously set remote candidates for connection checks from this stream.
+///
+/// `candidates` can be NULL to discover the number of candidates available.  Otherwise,
+/// `n_candidates` must contain the number of `RiceCandidate`s that `candidates` can hold and will
+/// be set to the number of `RiceCandidate`s that have been written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rice_stream_get_remote_candidates(
     stream: *mut RiceStream,
@@ -2673,14 +2681,12 @@ pub unsafe extern "C" fn rice_stream_get_remote_candidates(
             *n_candidates = proto_stream.remote_candidates().len();
         } else if *n_candidates > 0 {
             let candidates = core::slice::from_raw_parts_mut(candidates, *n_candidates);
-            *n_candidates = 0;
-            for candidate in proto_stream.remote_candidates() {
-                candidates[*n_candidates] = RiceCandidate::into_c_full(candidate.clone());
-                if *n_candidates + 1 > candidates.len() {
-                    break;
-                }
-                *n_candidates += 1;
+            let mut n_written = 0;
+            for (out, candidate) in candidates.iter_mut().zip(proto_stream.remote_candidates()) {
+                *out = RiceCandidate::into_c_full(candidate.clone());
+                n_written += 1;
             }
+            *n_candidates = n_written;
         }
 
         drop(proto_agent);
@@ -2824,14 +2830,12 @@ pub unsafe extern "C" fn rice_stream_component_ids(
             *len = proto_stream.component_ids_iter().count()
         } else if *len > 0 {
             let output = core::slice::from_raw_parts_mut(ret, *len);
-            *len = 0;
-            for component in proto_stream.component_ids_iter() {
-                output[*len] = component;
-                if *len + 1 > output.len() {
-                    break;
-                }
-                *len += 1;
+            let mut n_written = 0;
+            for (out, component) in output.iter_mut().zip(proto_stream.component_ids_iter()) {
+                *out = component;
+                n_written += 1;
             }
+            *len = n_written;
         }
 
         drop(proto_agent);
@@ -3628,6 +3632,110 @@ mod tests {
             rice_component_revoke_consent(component);
 
             rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_stream_candidates_smaller_buffer() {
+        unsafe {
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component = rice_stream_add_component(stream);
+
+            const N_CANDIDATES: usize = 3;
+            for i in 0..N_CANDIDATES as u16 {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1000 + i);
+                let local =
+                    Candidate::builder(1, CandidateType::Host, TransportType::Udp, "local", addr)
+                        .priority(1234)
+                        .build();
+                let gathered = RiceGatheredCandidate::into_c_full(GatheredCandidate {
+                    candidate: local,
+                    turn_agent: None,
+                });
+                assert!(rice_stream_add_local_gathered_candidate(stream, &gathered));
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2000 + i);
+                let remote =
+                    Candidate::builder(1, CandidateType::Host, TransportType::Udp, "remote", addr)
+                        .priority(1234)
+                        .build();
+                let remote = Box::into_raw(Box::new(RiceCandidate::into_c_full(remote)));
+                rice_stream_add_remote_candidate(stream, remote);
+                rice_candidate_free(remote);
+            }
+
+            let mut n_candidates = 0;
+            rice_stream_get_local_candidates(stream, &mut n_candidates, core::ptr::null_mut());
+            assert_eq!(n_candidates, N_CANDIDATES);
+            rice_stream_get_remote_candidates(stream, &mut n_candidates, core::ptr::null_mut());
+            assert_eq!(n_candidates, N_CANDIDATES);
+
+            // a buffer that is too small must only be filled with as many candidates as it can
+            // hold.
+            let mut candidates = (0..N_CANDIDATES)
+                .map(|_| RiceCandidate::zero())
+                .collect::<Vec<_>>();
+            let mut n_candidates = N_CANDIDATES - 1;
+            rice_stream_get_local_candidates(stream, &mut n_candidates, candidates.as_mut_ptr());
+            assert_eq!(n_candidates, N_CANDIDATES - 1);
+            for candidate in candidates.iter_mut() {
+                rice_candidate_clear(candidate);
+            }
+
+            let mut n_candidates = N_CANDIDATES - 1;
+            rice_stream_get_remote_candidates(stream, &mut n_candidates, candidates.as_mut_ptr());
+            assert_eq!(n_candidates, N_CANDIDATES - 1);
+            for candidate in candidates.iter_mut() {
+                rice_candidate_clear(candidate);
+            }
+
+            // a larger buffer is only filled with the available candidates.
+            let mut candidates = (0..N_CANDIDATES + 1)
+                .map(|_| RiceCandidate::zero())
+                .collect::<Vec<_>>();
+            let mut n_candidates = N_CANDIDATES + 1;
+            rice_stream_get_local_candidates(stream, &mut n_candidates, candidates.as_mut_ptr());
+            assert_eq!(n_candidates, N_CANDIDATES);
+            for candidate in candidates.iter_mut() {
+                rice_candidate_clear(candidate);
+            }
+
+            let mut n_candidates = N_CANDIDATES + 1;
+            rice_stream_get_remote_candidates(stream, &mut n_candidates, candidates.as_mut_ptr());
+            assert_eq!(n_candidates, N_CANDIDATES);
+            for candidate in candidates.iter_mut() {
+                rice_candidate_clear(candidate);
+            }
+
+            rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_stream_component_ids_smaller_buffer() {
+        unsafe {
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component1 = rice_stream_add_component(stream);
+            let component2 = rice_stream_add_component(stream);
+
+            let mut len = 0;
+            rice_stream_component_ids(stream, &mut len, core::ptr::null_mut());
+            assert_eq!(len, 2);
+
+            let mut ids = [0; 2];
+            let mut len = 1;
+            rice_stream_component_ids(stream, &mut len, ids.as_mut_ptr());
+            assert_eq!(len, 1);
+            assert_eq!(ids[0], 1);
+
+            rice_component_unref(component1);
+            rice_component_unref(component2);
             rice_stream_unref(stream);
             rice_agent_unref(agent);
         }
