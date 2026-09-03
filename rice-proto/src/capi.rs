@@ -1443,22 +1443,79 @@ pub unsafe extern "C" fn rice_tls_config_variant(config: *const RiceTlsConfig) -
     }
 }
 
+/// Construct a client side Openssl configuration builder for the provided transport.
+///
+/// `SslConnector::builder()` is used (and not `SslContextBuilder::new()`) as the former also
+/// configures `SSL_VERIFY_PEER` and the default certificate verification paths while the latter
+/// performs no certificate verification at all.
+///
+/// The builder (and not the built context) is returned as any certificate verification parameters
+/// need to be configured before the context is constructed.
+#[cfg(feature = "openssl")]
+fn openssl_client_context(
+    transport: RiceTransportType,
+) -> Option<openssl::ssl::SslConnectorBuilder> {
+    let method = match transport_type_from_c(transport) {
+        TransportType::Udp => openssl::ssl::SslMethod::dtls_client(),
+        TransportType::Tcp => openssl::ssl::SslMethod::tls_client(),
+    };
+    match openssl::ssl::SslConnector::builder(method) {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            warn!("Failed to create OpenSSL connector: {e:?}");
+            None
+        }
+    }
+}
+
 /// Construct a new TLS configuration using Openssl.
+///
+/// The returned configuration validates the certificate chain of the TURN server but performs no
+/// hostname or IP address identity check.  Any certificate that is valid for any host will be
+/// accepted.  Use `rice_tls_config_new_openssl_with_ip()` to also validate that the certificate
+/// was produced for a particular IP address.
 #[unsafe(no_mangle)]
 #[cfg(feature = "openssl")]
 pub unsafe extern "C" fn rice_tls_config_new_openssl(
     transport: RiceTransportType,
 ) -> *mut RiceTlsConfig {
-    let method = match transport_type_from_c(transport) {
-        TransportType::Udp => openssl::ssl::SslMethod::dtls_client(),
-        TransportType::Tcp => openssl::ssl::SslMethod::tls_client(),
-    };
-    let Ok(ctx) = openssl::ssl::SslConnector::builder(method) else {
+    let Some(ctx) = openssl_client_context(transport) else {
         return core::ptr::null_mut();
     };
     mut_override(Arc::into_raw(Arc::new(RiceTlsConfig {
         variant: OpensslTurnConfig::new(ctx.build().into_context()).into(),
     })))
+}
+
+/// Construct a new TLS configuration using Openssl that validates that the TURN server's
+/// certificate was produced for the provided IP address.
+///
+/// Only the IP address part of `addr` is used, the port is ignored.
+///
+/// The `addr` is only borrowed and remains owned by the caller.
+#[unsafe(no_mangle)]
+#[cfg(feature = "openssl")]
+pub unsafe extern "C" fn rice_tls_config_new_openssl_with_ip(
+    transport: RiceTransportType,
+    addr: *const RiceAddress,
+) -> *mut RiceTlsConfig {
+    unsafe {
+        let addr = RiceAddress::into_rice_none(addr);
+        let Some(mut ctx) = openssl_client_context(transport) else {
+            return core::ptr::null_mut();
+        };
+        // The verification parameters configured on the `SSL_CTX` are inherited by every `SSL`
+        // constructed from it.
+        let verify_param = ctx.verify_param_mut();
+        verify_param.set_hostflags(openssl::x509::verify::X509CheckFlags::NO_PARTIAL_WILDCARDS);
+        if let Err(e) = verify_param.set_ip(addr.inner().ip()) {
+            warn!("Failed to set the IP address to verify the certificate against: {e:?}");
+            return core::ptr::null_mut();
+        }
+        mut_override(Arc::into_raw(Arc::new(RiceTlsConfig {
+            variant: OpensslTurnConfig::new(ctx.build().into_context()).into(),
+        })))
+    }
 }
 
 /// Construct a new TLS configuration using Rustls.
@@ -3630,6 +3687,136 @@ mod tests {
             rice_component_unref(component);
             rice_stream_unref(stream);
             rice_agent_unref(agent);
+        }
+    }
+
+    #[cfg(feature = "openssl")]
+    mod openssl_tls {
+        use super::*;
+
+        use alloc::string::ToString;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        use openssl::asn1::Asn1Time;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::{PKey, Private};
+        use openssl::rsa::Rsa;
+        use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslStream, SslVerifyMode};
+        use openssl::x509::X509;
+        use openssl::x509::extension::SubjectAlternativeName;
+
+        /// Produce a self-signed certificate containing a single `iPAddress` subject alternative
+        /// name for `ip`.
+        fn self_signed_certificate(ip: IpAddr) -> (X509, PKey<Private>) {
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+
+            let mut name = openssl::x509::X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "rice test").unwrap();
+            let name = name.build();
+
+            let mut builder = X509::builder().unwrap();
+            builder.set_version(2).unwrap();
+            builder.set_subject_name(&name).unwrap();
+            builder.set_issuer_name(&name).unwrap();
+            builder.set_pubkey(&key).unwrap();
+            builder
+                .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            builder
+                .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+                .unwrap();
+            let san = SubjectAlternativeName::new()
+                .ip(&ip.to_string())
+                .build(&builder.x509v3_context(None, None))
+                .unwrap();
+            builder.append_extension(san).unwrap();
+            builder.sign(&key, MessageDigest::sha256()).unwrap();
+
+            (builder.build(), key)
+        }
+
+        /// Perform a TLS handshake against an in-process server presenting a certificate with
+        /// `cert_ip` as its only subject alternative name using a configuration constructed for
+        /// `verify_ip`.
+        ///
+        /// Returns all the certificate verification errors that were produced.
+        fn handshake_verification_errors(cert_ip: IpAddr, verify_ip: IpAddr) -> Vec<String> {
+            let (cert, key) = self_signed_certificate(cert_ip);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let server_addr = listener.local_addr().unwrap();
+
+            let server = thread::spawn(move || {
+                let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+                acceptor.set_private_key(&key).unwrap();
+                acceptor.set_certificate(&cert).unwrap();
+                let acceptor = acceptor.build();
+                let (stream, _addr) = listener.accept().unwrap();
+                // the client is expected to abort the handshake on a verification failure.
+                let _ = acceptor.accept(stream);
+            });
+
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let addr = RiceAddress::new(SocketAddr::new(verify_ip, 0)).into_c_full();
+            let config =
+                unsafe { rice_tls_config_new_openssl_with_ip(RiceTransportType::Tcp, addr) };
+            assert!(!config.is_null());
+            let ssl_context = unsafe {
+                let config = Arc::from_raw(config.cast_const());
+                #[allow(unreachable_patterns)]
+                let ssl_context = match &config.variant {
+                    TurnTlsConfig::Openssl(config) => config.ssl_context().clone(),
+                    _ => unreachable!(),
+                };
+                drop(config);
+                ssl_context
+            };
+            unsafe { RiceAddress::into_rice_full(addr) };
+
+            let mut ssl = Ssl::new(&ssl_context).unwrap();
+            let callback_errors = errors.clone();
+            // the certificate is self-signed so the chain will never validate. Accept the
+            // certificate regardless in order to be able to observe the identity check.
+            ssl.set_verify_callback(SslVerifyMode::PEER, move |_valid, store| {
+                let error = store.error();
+                if error != openssl::x509::X509VerifyResult::OK {
+                    callback_errors
+                        .lock()
+                        .unwrap()
+                        .push(error.error_string().to_string());
+                }
+                true
+            });
+            let stream = TcpStream::connect(server_addr).unwrap();
+            let mut stream = SslStream::new(ssl, stream).unwrap();
+            stream.connect().unwrap();
+            drop(stream);
+            server.join().unwrap();
+
+            let errors = errors.lock().unwrap();
+            errors.clone()
+        }
+
+        #[test]
+        fn rice_tls_config_openssl_with_ip_matches() {
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let errors = handshake_verification_errors(ip, ip);
+            assert!(
+                !errors.iter().any(|e| e.contains("IP address mismatch")),
+                "unexpected IP address mismatch, got: {errors:?}"
+            );
+        }
+
+        #[test]
+        fn rice_tls_config_openssl_with_ip_mismatches() {
+            let errors = handshake_verification_errors(
+                IpAddr::V4(Ipv4Addr::new(10, 11, 12, 13)),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            );
+            assert!(
+                errors.iter().any(|e| e.contains("IP address mismatch")),
+                "expected an IP address mismatch, got: {errors:?}"
+            );
         }
     }
 }
