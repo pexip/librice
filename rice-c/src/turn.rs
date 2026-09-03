@@ -428,18 +428,17 @@ mod tests {
         #[test]
         fn test_openssl_with_ip_roundtrip() {
             let addr = "127.0.0.1:3478".parse::<SocketAddr>().unwrap();
-            let cfg = TurnTlsConfig::new_openssl_with_ip(TransportType::Tcp, &addr.into());
-            let cloned = cfg.clone();
-            drop(cfg);
-            let mut config = TurnConfig::new(
-                TransportType::Tcp,
-                turn_server_address(),
-                turn_credentials(),
-            );
-            config.set_tls_config(cloned.clone());
-            drop(cloned);
-            let retrieved = config.tls_config().unwrap();
-            assert!(matches!(retrieved, TurnTlsConfig::Openssl(_)));
+            for transport in [TransportType::Udp, TransportType::Tcp] {
+                let cfg = TurnTlsConfig::new_openssl_with_ip(transport, &addr.into());
+                let cloned = cfg.clone();
+                drop(cfg);
+                let mut config =
+                    TurnConfig::new(transport, turn_server_address(), turn_credentials());
+                config.set_tls_config(cloned.clone());
+                drop(cloned);
+                let retrieved = config.tls_config().unwrap();
+                assert!(matches!(retrieved, TurnTlsConfig::Openssl(_)));
+            }
         }
 
         #[test]
