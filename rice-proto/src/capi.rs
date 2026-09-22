@@ -3920,6 +3920,78 @@ mod tests {
     }
 
     #[test]
+    fn rice_agent_gather_loopback() {
+        unsafe {
+            let addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+            let addr = RiceAddress::new(addr).into_c_full();
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component = rice_stream_add_component(stream);
+            let transport = TransportType::Udp;
+
+            let ret = rice_component_gather_candidates(
+                component,
+                1,
+                &addr,
+                &transport_type_to_c(transport),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            assert_eq!(ret, RiceError::Success);
+            rice_address_free(mut_override(addr));
+
+            let mut poll = RiceAgentPoll::Closed;
+            rice_agent_poll(agent, 0, &mut poll);
+            let RiceAgentPoll::GatheredCandidate(ref _candidate) = poll else {
+                unreachable!(
+                    "a loopback socket the caller asked for must still produce a host candidate"
+                );
+            };
+            rice_agent_poll_clear(&mut poll);
+
+            let mut poll = RiceAgentPoll::Closed;
+            rice_agent_poll(agent, 0, &mut poll);
+            let RiceAgentPoll::GatheringComplete(ref _complete) = poll else {
+                unreachable!()
+            };
+            rice_agent_poll_clear(&mut poll);
+
+            rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_agent_gather_nothing_fails() {
+        unsafe {
+            let addr: SocketAddr = "0.0.0.0:1000".parse().unwrap();
+            let addr = RiceAddress::new(addr).into_c_full();
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component = rice_stream_add_component(stream);
+            let transport = TransportType::Udp;
+
+            let ret = rice_component_gather_candidates(
+                component,
+                1,
+                &addr,
+                &transport_type_to_c(transport),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            assert_eq!(ret, RiceError::ResourceNotFound);
+            rice_address_free(mut_override(addr));
+
+            rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
     fn rice_agent_poll_transmit_null() {
         unsafe {
             let agent = rice_agent_new(true, false);
