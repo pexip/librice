@@ -3397,6 +3397,11 @@ pub unsafe extern "C" fn rice_stream_get_component(
 /// - `turn_sockets`: An array of local addresses for producing TURN candidates.
 /// - `turn_config`: An array of TURN server configurations.
 ///
+/// The addresses in `sockets_addr` are the local addresses of sockets that the caller has already
+/// bound and are used as-is.  Deciding which local addresses are worth gathering from, e.g.
+/// whether to include loopback addresses, is the caller's choice.  Only addresses that can never
+/// be used as a candidate base (unspecified or multicast addresses) are discarded.
+///
 /// Candidates will be generated as follows (if they succeed):
 ///
 /// 1. A host candidate for each `(sockets_transports[i], socket_addr[i])`. If TCP, then both an
@@ -3411,6 +3416,11 @@ pub unsafe extern "C" fn rice_stream_get_component(
 ///    provided array. The `turn_sockets[i]` value is the local address to communicate with the
 ///    TURN server in `turn_config[i]` and should be different than any value provided through
 ///    `sockets_addr`.
+///
+/// Returns `RICE_ERROR_ALREADY_IN_PROGRESS` if gathering has already been started for this
+/// component, or `RICE_ERROR_RESOURCE_NOT_FOUND` if nothing could be gathered from the provided
+/// arguments, e.g. no usable local addresses were provided.  In the latter case gathering is not
+/// started and can be retried with different arguments.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rice_component_gather_candidates(
     component: *mut RiceComponent,
