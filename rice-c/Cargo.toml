@@ -14,9 +14,11 @@ workspace = ".."
 
 [features]
 default = ["rustls", "openssl"]
-dimpl = []
 openssl = []
 rustls = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("dimpl"))'] }
 
 [build-dependencies]
 system-deps = "7"

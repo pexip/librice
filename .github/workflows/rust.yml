@@ -89,8 +89,6 @@ jobs:
       if: matrix.runs-on == 'ubuntu-latest'
     - name: Run tests (No default features + rustls)
       run: cargo test --verbose --no-default-features --features runtime-smol,rustls
-    - name: Run tests (No default features + dimpl)
-      run: cargo test --verbose --no-default-features --features runtime-smol,dimpl
   clippy:
     runs-on: ubuntu-latest
     steps:
