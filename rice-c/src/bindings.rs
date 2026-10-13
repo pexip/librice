@@ -6,11 +6,22 @@ pub const RICE_PROTO_PATCH: u32 = 3;
 pub const RICE_PROTO_RUSTLS: u32 = 1;
 pub const RICE_PROTO_OPENSSL: u32 = 1;
 pub const RICE_PROTO_DIMPL: u32 = 1;
-#[doc = " The UDP transport"]
-pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
-#[doc = " The TCP transport"]
-pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
-pub type RiceTransportType = u32;
+#[doc = " Component is in initial state and no connectivity checks are in progress."]
+pub const RICE_COMPONENT_CONNECTION_STATE_NEW: RiceComponentConnectionState = 0;
+#[doc = " Connectivity checks are in progress for this candidate."]
+pub const RICE_COMPONENT_CONNECTION_STATE_CONNECTING: RiceComponentConnectionState = 1;
+#[doc = " A valid pair has been discovered."]
+pub const RICE_COMPONENT_CONNECTION_STATE_CONNECTED: RiceComponentConnectionState = 2;
+#[doc = " A [`CandidatePair`](crate::candidate::CandidatePair`) has been selected for this component."]
+pub const RICE_COMPONENT_CONNECTION_STATE_COMPLETED: RiceComponentConnectionState = 3;
+#[doc = " No connection could be found for this Component."]
+pub const RICE_COMPONENT_CONNECTION_STATE_FAILED: RiceComponentConnectionState = 4;
+pub type RiceComponentConnectionState = u32;
+#[doc = " IP version 4."]
+pub const RICE_ADDRESS_FAMILY_IPV4: RiceAddressFamily = 1;
+#[doc = " IP version 6."]
+pub const RICE_ADDRESS_FAMILY_IPV6: RiceAddressFamily = 2;
+pub type RiceAddressFamily = u32;
 #[doc = " The candidate is a local network interface"]
 pub const RICE_CANDIDATE_TYPE_HOST: RiceCandidateType = 0;
 #[doc = " The candidate was discovered from incoming data"]
@@ -20,34 +31,15 @@ pub const RICE_CANDIDATE_TYPE_SERVER_REFLEXIVE: RiceCandidateType = 2;
 #[doc = " The candidate will relay all data through an external server (TURN)."]
 pub const RICE_CANDIDATE_TYPE_RELAYED: RiceCandidateType = 3;
 pub type RiceCandidateType = u32;
-#[doc = " Not a TCP candidate."]
-pub const RICE_TCP_TYPE_NONE: RiceTcpType = 0;
-#[doc = " The candidate address will connect to a remote address."]
-pub const RICE_TCP_TYPE_ACTIVE: RiceTcpType = 1;
-#[doc = " The candidate will listen for incominng TCP connections."]
-pub const RICE_TCP_TYPE_PASSIVE: RiceTcpType = 2;
-#[doc = " Simultaneous open.  The candidate will both listen for incoming connections, and connect to\n remote addresses."]
-pub const RICE_TCP_TYPE_SO: RiceTcpType = 3;
-pub type RiceTcpType = u32;
-#[doc = " Component is in initial state and no connectivity checks are in progress."]
-pub const RICE_COMPONENT_CONNECTION_STATE_NEW: RiceComponentConnectionState = 0;
-#[doc = " Connectivity checks are in progress for this candidate"]
-pub const RICE_COMPONENT_CONNECTION_STATE_CONNECTING: RiceComponentConnectionState = 1;
-#[doc = " A [`CandidatePair`](crate::candidate::CandidatePair`) has been selected for this component"]
-pub const RICE_COMPONENT_CONNECTION_STATE_CONNECTED: RiceComponentConnectionState = 2;
-#[doc = " No connection could be found for this Component"]
-pub const RICE_COMPONENT_CONNECTION_STATE_FAILED: RiceComponentConnectionState = 3;
-pub type RiceComponentConnectionState = u32;
-#[doc = " IP version 4."]
-pub const RICE_ADDRESS_FAMILY_IPV4: RiceAddressFamily = 1;
-#[doc = " IP version 6."]
-pub const RICE_ADDRESS_FAMILY_IPV6: RiceAddressFamily = 2;
-pub type RiceAddressFamily = u32;
-#[doc = " The SHA-1 HMAC."]
-pub const RICE_INTEGRITY_ALGORITHM_SHA1: RiceIntegrityAlgorithm = 1;
-#[doc = " The SHA-256 HMAC."]
-pub const RICE_INTEGRITY_ALGORITHM_SHA256: RiceIntegrityAlgorithm = 2;
-pub type RiceIntegrityAlgorithm = u32;
+#[doc = " Not an error. The operation was completed successfully."]
+pub const RICE_ERROR_SUCCESS: RiceError = 0;
+#[doc = " The operation failed for an unspecified reason."]
+pub const RICE_ERROR_FAILED: RiceError = -1;
+#[doc = " A required resource was not found."]
+pub const RICE_ERROR_RESOURCE_NOT_FOUND: RiceError = -2;
+#[doc = " The operation is already in progress."]
+pub const RICE_ERROR_ALREADY_IN_PROGRESS: RiceError = -3;
+pub type RiceError = i32;
 #[doc = " The configuration will not be used."]
 pub const RICE_FEATURE_DISABLED: RiceFeature = -1;
 #[doc = " The configuration will automatically be used when supported."]
@@ -55,20 +47,11 @@ pub const RICE_FEATURE_AUTO: RiceFeature = 0;
 #[doc = " The configuration is enabled and required."]
 pub const RICE_FEATURE_REQUIRED: RiceFeature = 1;
 pub type RiceFeature = i32;
-#[doc = " Openssl."]
-pub const RICE_TLS_VARIANT_OPENSSL: RiceTlsVariant = 1;
-#[doc = " Rustls."]
-pub const RICE_TLS_VARIANT_RUSTLS: RiceTlsVariant = 2;
-#[doc = " Dimpl."]
-pub const RICE_TLS_VARIANT_DIMPL: RiceTlsVariant = 3;
-pub type RiceTlsVariant = u32;
-#[doc = " No role change."]
-pub const RICE_ROLE_CHANGE_NONE: RiceRoleChange = 0;
-#[doc = " Change role to Lite."]
-pub const RICE_ROLE_CHANGE_LITE: RiceRoleChange = 1;
-#[doc = " Change role to Full."]
-pub const RICE_ROLE_CHANGE_FULL: RiceRoleChange = 2;
-pub type RiceRoleChange = i32;
+#[doc = " The SHA-1 HMAC."]
+pub const RICE_INTEGRITY_ALGORITHM_SHA1: RiceIntegrityAlgorithm = 1;
+#[doc = " The SHA-256 HMAC."]
+pub const RICE_INTEGRITY_ALGORITHM_SHA256: RiceIntegrityAlgorithm = 2;
+pub type RiceIntegrityAlgorithm = u32;
 #[doc = " No error."]
 pub const RICE_PARSE_CANDIDATE_ERROR_SUCCESS: RiceParseCandidateError = 0;
 #[doc = " Not a candidate message."]
@@ -90,15 +73,34 @@ pub const RICE_PARSE_CANDIDATE_ERROR_BAD_EXTENSION: RiceParseCandidateError = -8
 #[doc = " Data is not well formed."]
 pub const RICE_PARSE_CANDIDATE_ERROR_MALFORMED: RiceParseCandidateError = -9;
 pub type RiceParseCandidateError = i32;
-#[doc = " Not an error. The operation was completed successfully."]
-pub const RICE_ERROR_SUCCESS: RiceError = 0;
-#[doc = " The operation failed for an unspecified reason."]
-pub const RICE_ERROR_FAILED: RiceError = -1;
-#[doc = " A required resource was not found."]
-pub const RICE_ERROR_RESOURCE_NOT_FOUND: RiceError = -2;
-#[doc = " The operation is already in progress."]
-pub const RICE_ERROR_ALREADY_IN_PROGRESS: RiceError = -3;
-pub type RiceError = i32;
+#[doc = " No role change."]
+pub const RICE_ROLE_CHANGE_NONE: RiceRoleChange = 0;
+#[doc = " Change role to Lite."]
+pub const RICE_ROLE_CHANGE_LITE: RiceRoleChange = 1;
+#[doc = " Change role to Full."]
+pub const RICE_ROLE_CHANGE_FULL: RiceRoleChange = 2;
+pub type RiceRoleChange = i32;
+#[doc = " Not a TCP candidate."]
+pub const RICE_TCP_TYPE_NONE: RiceTcpType = 0;
+#[doc = " The candidate address will connect to a remote address."]
+pub const RICE_TCP_TYPE_ACTIVE: RiceTcpType = 1;
+#[doc = " The candidate will listen for incominng TCP connections."]
+pub const RICE_TCP_TYPE_PASSIVE: RiceTcpType = 2;
+#[doc = " Simultaneous open.  The candidate will both listen for incoming connections, and connect to\n remote addresses."]
+pub const RICE_TCP_TYPE_SO: RiceTcpType = 3;
+pub type RiceTcpType = u32;
+#[doc = " Openssl."]
+pub const RICE_TLS_VARIANT_OPENSSL: RiceTlsVariant = 1;
+#[doc = " Rustls."]
+pub const RICE_TLS_VARIANT_RUSTLS: RiceTlsVariant = 2;
+#[doc = " Dimpl."]
+pub const RICE_TLS_VARIANT_DIMPL: RiceTlsVariant = 3;
+pub type RiceTlsVariant = u32;
+#[doc = " The UDP transport"]
+pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
+#[doc = " The TCP transport"]
+pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
+pub type RiceTransportType = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct Credentials {
@@ -149,7 +151,7 @@ pub struct RiceTlsConfig {
 pub struct RiceTurnConfig {
     _unused: [u8; 0],
 }
-#[doc = " A pointer to a sequence of bytes and the associated size."]
+#[doc = " A pointer to a sequence of bytes and the associated size.\n\n `size` indicates the total number of valid bytes starting from position 0.\n `offset` is the number of bytes into `ptr` to start reading from."]
 #[repr(C)]
 #[derive(Debug)]
 pub struct RiceDataImpl {
@@ -157,13 +159,17 @@ pub struct RiceDataImpl {
     pub ptr: *mut u8,
     #[doc = " Number of bytes pointed to in `ptr`."]
     pub size: usize,
+    #[doc = " Byte offset into `ptr` to start reading from."]
+    pub offset: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of RiceDataImpl"][::core::mem::size_of::<RiceDataImpl>() - 16usize];
+    ["Size of RiceDataImpl"][::core::mem::size_of::<RiceDataImpl>() - 24usize];
     ["Alignment of RiceDataImpl"][::core::mem::align_of::<RiceDataImpl>() - 8usize];
     ["Offset of field: RiceDataImpl::ptr"][::core::mem::offset_of!(RiceDataImpl, ptr) - 0usize];
     ["Offset of field: RiceDataImpl::size"][::core::mem::offset_of!(RiceDataImpl, size) - 8usize];
+    ["Offset of field: RiceDataImpl::offset"]
+        [::core::mem::offset_of!(RiceDataImpl, offset) - 16usize];
 };
 #[doc = " The data is borrowed and will not be freed on destruction."]
 pub const RICE_DATA_BORROWED: RiceData_Tag = 0;
@@ -189,7 +195,7 @@ pub struct RiceData__bindgen_ty_1__bindgen_ty_1 {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of RiceData__bindgen_ty_1__bindgen_ty_1"]
-        [::core::mem::size_of::<RiceData__bindgen_ty_1__bindgen_ty_1>() - 16usize];
+        [::core::mem::size_of::<RiceData__bindgen_ty_1__bindgen_ty_1>() - 24usize];
     ["Alignment of RiceData__bindgen_ty_1__bindgen_ty_1"]
         [::core::mem::align_of::<RiceData__bindgen_ty_1__bindgen_ty_1>() - 8usize];
     ["Offset of field: RiceData__bindgen_ty_1__bindgen_ty_1::borrowed"]
@@ -203,7 +209,7 @@ pub struct RiceData__bindgen_ty_1__bindgen_ty_2 {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of RiceData__bindgen_ty_1__bindgen_ty_2"]
-        [::core::mem::size_of::<RiceData__bindgen_ty_1__bindgen_ty_2>() - 16usize];
+        [::core::mem::size_of::<RiceData__bindgen_ty_1__bindgen_ty_2>() - 24usize];
     ["Alignment of RiceData__bindgen_ty_1__bindgen_ty_2"]
         [::core::mem::align_of::<RiceData__bindgen_ty_1__bindgen_ty_2>() - 8usize];
     ["Offset of field: RiceData__bindgen_ty_1__bindgen_ty_2::owned"]
@@ -211,13 +217,13 @@ const _: () = {
 };
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of RiceData__bindgen_ty_1"][::core::mem::size_of::<RiceData__bindgen_ty_1>() - 16usize];
+    ["Size of RiceData__bindgen_ty_1"][::core::mem::size_of::<RiceData__bindgen_ty_1>() - 24usize];
     ["Alignment of RiceData__bindgen_ty_1"]
         [::core::mem::align_of::<RiceData__bindgen_ty_1>() - 8usize];
 };
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of RiceData"][::core::mem::size_of::<RiceData>() - 24usize];
+    ["Size of RiceData"][::core::mem::size_of::<RiceData>() - 32usize];
     ["Alignment of RiceData"][::core::mem::align_of::<RiceData>() - 8usize];
     ["Offset of field: RiceData::tag"][::core::mem::offset_of!(RiceData, tag) - 0usize];
 };
@@ -237,7 +243,7 @@ pub struct RiceTransmit {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of RiceTransmit"][::core::mem::size_of::<RiceTransmit>() - 56usize];
+    ["Size of RiceTransmit"][::core::mem::size_of::<RiceTransmit>() - 64usize];
     ["Alignment of RiceTransmit"][::core::mem::align_of::<RiceTransmit>() - 8usize];
     ["Offset of field: RiceTransmit::stream_id"]
         [::core::mem::offset_of!(RiceTransmit, stream_id) - 0usize];
@@ -613,7 +619,7 @@ pub struct RiceStreamIncomingData {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of RiceStreamIncomingData"][::core::mem::size_of::<RiceStreamIncomingData>() - 32usize];
+    ["Size of RiceStreamIncomingData"][::core::mem::size_of::<RiceStreamIncomingData>() - 40usize];
     ["Alignment of RiceStreamIncomingData"]
         [::core::mem::align_of::<RiceStreamIncomingData>() - 8usize];
     ["Offset of field: RiceStreamIncomingData::handled"]

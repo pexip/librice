@@ -548,6 +548,9 @@ pub enum RiceData {
 }
 
 /// A pointer to a sequence of bytes and the associated size.
+///
+/// `size` indicates the total number of valid bytes starting from position 0.
+/// `offset` is the number of bytes into `ptr` to start reading from.
 #[derive(Debug)]
 #[repr(C)]
 pub struct RiceDataImpl {
@@ -555,6 +558,8 @@ pub struct RiceDataImpl {
     ptr: *mut u8,
     /// Number of bytes pointed to in `ptr`.
     size: usize,
+    /// Byte offset into `ptr` to start reading from.
+    offset: usize,
 }
 
 impl RiceDataImpl {
@@ -568,7 +573,11 @@ impl RiceDataImpl {
     fn owned_to_c(val: Box<[u8]>) -> Self {
         let size = val.len();
         let ptr = Box::into_raw(val) as *mut _;
-        Self { ptr, size }
+        Self {
+            ptr,
+            size,
+            offset: 0,
+        }
     }
 
     unsafe fn borrowed_from_c<'a>(self) -> &'a [u8] {
@@ -582,6 +591,7 @@ impl RiceDataImpl {
         Self {
             ptr: mut_override(val.as_ptr()),
             size: val.len(),
+            offset: 0,
         }
     }
 }
@@ -591,6 +601,7 @@ impl Default for RiceDataImpl {
         Self {
             ptr: core::ptr::null_mut(),
             size: 0,
+            offset: 0,
         }
     }
 }
@@ -2973,16 +2984,14 @@ pub unsafe extern "C" fn rice_stream_handle_incoming_data(
         let data = if let Some(data_and_range) = &stream_ret.data {
             // XXX: currently we never return subbuffers of the original data however this code
             // will be wrong once that occurs.
-            debug_assert!(data_and_range.range().start == 0);
+            let r = data_and_range.range();
             RiceDataImpl {
                 ptr: mut_override(data),
-                size: data_and_range.range().end,
+                size: r.end,
+                offset: r.start,
             }
         } else {
-            RiceDataImpl {
-                ptr: core::ptr::null_mut(),
-                size: 0,
-            }
+            RiceDataImpl::default()
         };
 
         (*ret).handled = stream_ret.handled;
@@ -3538,7 +3547,11 @@ pub unsafe extern "C" fn rice_component_send(
             }
             Err(e) => {
                 warn!("Failed to send data: {e:?}");
-                RiceError::Failed
+                match e {
+                    AgentError::AlreadyInProgress => RiceError::AlreadyInProgress,
+                    AgentError::ResourceNotFound => RiceError::ResourceNotFound,
+                    _ => RiceError::Failed,
+                }
             }
         };
 
@@ -4060,7 +4073,7 @@ mod tests {
             // left untouched.
             let ret =
                 rice_component_send(component, data.as_mut_ptr(), data.len(), 0, &mut transmit);
-            assert_eq!(ret, RiceError::Failed);
+            assert_eq!(ret, RiceError::ResourceNotFound);
             assert!(transmit.from.is_null());
             assert!(transmit.to.is_null());
             assert_eq!(rice_data_len(&transmit.data), 0);
