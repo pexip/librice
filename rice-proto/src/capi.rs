@@ -564,6 +564,9 @@ pub struct RiceDataImpl {
 
 impl RiceDataImpl {
     unsafe fn owned_from_c(self) -> Box<[u8]> {
+        if self.ptr.is_null() {
+            return Box::default();
+        }
         unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(self.ptr, self.size)) }
     }
 
@@ -578,7 +581,10 @@ impl RiceDataImpl {
     }
 
     unsafe fn borrowed_from_c<'a>(self) -> &'a [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.size) }
+        if self.ptr.is_null() {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.ptr, self.size) }
     }
 
     fn borrowed_to_c(val: &[u8]) -> Self {
@@ -3379,7 +3385,7 @@ pub unsafe extern "C" fn rice_stream_get_component(
         let ret = if let Some(component) = inner.components.get(component_id - 1) {
             mut_override(Arc::into_raw(component.clone()))
         } else {
-            return mut_override(core::ptr::null::<RiceComponent>());
+            mut_override(core::ptr::null::<RiceComponent>())
         };
 
         drop(inner);
@@ -3400,6 +3406,11 @@ pub unsafe extern "C" fn rice_stream_get_component(
 /// - `turn_sockets`: An array of local addresses for producing TURN candidates.
 /// - `turn_config`: An array of TURN server configurations.
 ///
+/// The addresses in `sockets_addr` are the local addresses of sockets that the caller has already
+/// bound and are used as-is.  Deciding which local addresses are worth gathering from, e.g.
+/// whether to include loopback addresses, is the caller's choice.  Only addresses that can never
+/// be used as a candidate base (unspecified or multicast addresses) are discarded.
+///
 /// Candidates will be generated as follows (if they succeed):
 ///
 /// 1. A host candidate for each `(sockets_transports[i], socket_addr[i])`. If TCP, then both an
@@ -3414,6 +3425,11 @@ pub unsafe extern "C" fn rice_stream_get_component(
 ///    provided array. The `turn_sockets[i]` value is the local address to communicate with the
 ///    TURN server in `turn_config[i]` and should be different than any value provided through
 ///    `sockets_addr`.
+///
+/// Returns `RICE_ERROR_ALREADY_IN_PROGRESS` if gathering has already been started for this
+/// component, or `RICE_ERROR_RESOURCE_NOT_FOUND` if nothing could be gathered from the provided
+/// arguments, e.g. no usable local addresses were provided.  In the latter case gathering is not
+/// started and can be retried with different arguments.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rice_component_gather_candidates(
     component: *mut RiceComponent,
@@ -3821,6 +3837,28 @@ mod tests {
     }
 
     #[test]
+    fn rice_stream_get_component_missing_keeps_stream_ref() {
+        unsafe fn strong_count(stream: *const RiceStream) -> usize {
+            unsafe {
+                let stream = Arc::from_raw(stream);
+                let count = Arc::strong_count(&stream);
+                core::mem::forget(stream);
+                count
+            }
+        }
+        unsafe {
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let before = strong_count(stream);
+            assert!(rice_stream_get_component(stream, 7).is_null());
+            assert!(rice_stream_get_component(stream, 0).is_null());
+            assert_eq!(before, strong_count(stream));
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
     fn rice_agent_gather() {
         unsafe {
             let addr: SocketAddr = "192.168.0.1:1000".parse().unwrap();
@@ -3917,6 +3955,78 @@ mod tests {
     }
 
     #[test]
+    fn rice_agent_gather_loopback() {
+        unsafe {
+            let addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+            let addr = RiceAddress::new(addr).into_c_full();
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component = rice_stream_add_component(stream);
+            let transport = TransportType::Udp;
+
+            let ret = rice_component_gather_candidates(
+                component,
+                1,
+                &addr,
+                &transport_type_to_c(transport),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            assert_eq!(ret, RiceError::Success);
+            rice_address_free(mut_override(addr));
+
+            let mut poll = RiceAgentPoll::Closed;
+            rice_agent_poll(agent, 0, &mut poll);
+            let RiceAgentPoll::GatheredCandidate(ref _candidate) = poll else {
+                unreachable!(
+                    "a loopback socket the caller asked for must still produce a host candidate"
+                );
+            };
+            rice_agent_poll_clear(&mut poll);
+
+            let mut poll = RiceAgentPoll::Closed;
+            rice_agent_poll(agent, 0, &mut poll);
+            let RiceAgentPoll::GatheringComplete(ref _complete) = poll else {
+                unreachable!()
+            };
+            rice_agent_poll_clear(&mut poll);
+
+            rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_agent_gather_nothing_fails() {
+        unsafe {
+            let addr: SocketAddr = "0.0.0.0:1000".parse().unwrap();
+            let addr = RiceAddress::new(addr).into_c_full();
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component = rice_stream_add_component(stream);
+            let transport = TransportType::Udp;
+
+            let ret = rice_component_gather_candidates(
+                component,
+                1,
+                &addr,
+                &transport_type_to_c(transport),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            assert_eq!(ret, RiceError::ResourceNotFound);
+            rice_address_free(mut_override(addr));
+
+            rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
     fn rice_agent_poll_transmit_null() {
         unsafe {
             let agent = rice_agent_new(true, false);
@@ -3927,8 +4037,51 @@ mod tests {
             assert!(transmit.from.is_null());
             assert!(transmit.to.is_null());
             assert_eq!(rice_data_len(&transmit.data), 0);
+            rice_transmit_clear(&mut transmit);
             rice_agent_unref(agent);
             rice_stream_unref(stream);
+        }
+    }
+
+    #[test]
+    fn rice_transmit_clear_idempotent() {
+        unsafe {
+            let mut transmit = MaybeUninit::uninit();
+            rice_transmit_init(&mut transmit);
+            let mut transmit = transmit.assume_init();
+
+            rice_transmit_clear(&mut transmit);
+            rice_transmit_clear(&mut transmit);
+
+            assert!(transmit.from.is_null());
+            assert!(transmit.to.is_null());
+            assert!(rice_data_ptr(&transmit.data).is_null());
+            assert_eq!(rice_data_len(&transmit.data), 0);
+        }
+    }
+
+    #[test]
+    fn rice_component_send_failure_transmit_clear() {
+        unsafe {
+            let agent = rice_agent_new(true, false);
+            let stream = rice_agent_add_stream(agent);
+            let component = rice_stream_add_component(stream);
+
+            let mut transmit = RiceTransmit::default();
+            let mut data = [0, 1, 2, 3];
+            // No pair has been selected for the component so sending must fail and `transmit` is
+            // left untouched.
+            let ret =
+                rice_component_send(component, data.as_mut_ptr(), data.len(), 0, &mut transmit);
+            assert_eq!(ret, RiceError::ResourceNotFound);
+            assert!(transmit.from.is_null());
+            assert!(transmit.to.is_null());
+            assert_eq!(rice_data_len(&transmit.data), 0);
+            rice_transmit_clear(&mut transmit);
+
+            rice_component_unref(component);
+            rice_stream_unref(stream);
+            rice_agent_unref(agent);
         }
     }
 

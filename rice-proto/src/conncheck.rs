@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
-use core::net::{IpAddr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
@@ -45,6 +45,10 @@ use turn_client_proto::prelude::*;
 use tracing::{debug, info, trace, warn};
 
 static STUN_AGENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Placeholder remote address for cases where a remote address is not applicable, e.g. a UDP
+/// [`StunAgent`] which is shared between all remote peers.
+const UNSPECIFIED_REMOTE_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct StunAgentId(usize);
@@ -781,6 +785,22 @@ impl ConnCheckList {
             })
             .collect::<VecDeque<_>>();
         self.pairs = new_pairs;
+        // A check that is in progress without an outstanding STUN request can never make any
+        // progress on its own as nothing will retransmit or time out.  Reset it to Waiting so
+        // that it is retried with the new credentials.  TCP checks are excluded as they are
+        // in progress while their connection is being established.
+        for check in self.pairs.iter_mut() {
+            if check.state == CandidatePairState::InProgress
+                && check.stun_request.is_none()
+                && matches!(check.variant, ConnCheckVariant::Agent(_))
+            {
+                debug!(
+                    "resetting check {} without a request back to waiting",
+                    check.conncheck_id
+                );
+                check.set_state(CandidatePairState::Waiting);
+            }
+        }
         self.sort_pairs();
 
         for (agent_id, request_id) in request_cancels {
@@ -866,7 +886,7 @@ impl ConnCheckList {
                 TransportType::Tcp => {
                     a.agent.local_addr() == local
                         && a.agent.transport() == TransportType::Tcp
-                        && a.agent.remote_addr().unwrap() == remote
+                        && a.agent.remote_addr() == Some(remote)
                 }
             };
             if matched {
@@ -891,7 +911,7 @@ impl ConnCheckList {
                 TransportType::Tcp => {
                     a.agent.local_addr() == local
                         && a.agent.transport() == TransportType::Tcp
-                        && a.agent.remote_addr().unwrap() == remote
+                        && a.agent.remote_addr() == Some(remote)
                 }
             };
             if matched {
@@ -922,9 +942,15 @@ impl ConnCheckList {
         })
     }
 
-    pub(crate) fn find_or_create_udp_agent(
+    /// Find an existing [`StunAgent`] that can communicate with `remote` using `candidate`, or
+    /// construct one.
+    ///
+    /// `remote` is only relevant for TCP where an agent is bound to a single connection and must
+    /// always have a remote address configured.  UDP agents are shared between all remote peers.
+    pub(crate) fn find_or_create_agent(
         &mut self,
         candidate: &Candidate,
+        remote: SocketAddr,
         turn_id: Option<StunAgentId>,
     ) -> (StunAgentId, &StunAgent) {
         if let Some(agent_id) = self
@@ -932,19 +958,16 @@ impl ConnCheckList {
             .iter()
             .find(|a| {
                 let a = &a.agent;
-                match candidate.transport_type {
-                    TransportType::Udp => {
-                        a.local_addr() == candidate.base_address
-                            && a.transport() == TransportType::Udp
-                    }
-                    _ => false,
-                }
+                a.transport() == candidate.transport_type
+                    && a.local_addr() == candidate.base_address
+                    && (candidate.transport_type != TransportType::Tcp
+                        || a.remote_addr() == Some(remote))
             })
             .map(|a| a.id)
         {
             return (agent_id, self.agent_by_id(agent_id).unwrap());
         }
-        let agent = StunAgent::builder(candidate.transport_type, candidate.base_address).build();
+        let agent = new_agent(candidate.transport_type, candidate.base_address, remote);
         let (agent_id, agent_idx) = self.add_agent(agent, turn_id);
         (agent_id, &self.agents[agent_idx].agent)
     }
@@ -1154,7 +1177,8 @@ impl ConnCheckList {
 
         match local.transport_type {
             TransportType::Udp => {
-                let (agent_id, _) = self.find_or_create_udp_agent(&local, turn_id);
+                let (agent_id, _) =
+                    self.find_or_create_agent(&local, UNSPECIFIED_REMOTE_ADDR, turn_id);
                 self.local_candidates.push(ConnCheckLocalCandidate {
                     candidate: local,
                     variant: LocalCandidateVariant::Agent(agent_id),
@@ -1237,16 +1261,34 @@ impl ConnCheckList {
         // triggered checks referenced by these ids may be removed before the check has a chance to
         // start.  Simply remove them and continue processing.
         while let Some(check_id) = self.triggered.pop_back() {
-            if let Some(check) = self.mut_check_by_id(check_id) {
-                // Don't trigger this check if there is already a STUN request in progress.
-                // Can happen on remote input if the same check is triggered while the check is
-                // sent to the peer.
-                if check.stun_request.is_some() {
-                    continue;
-                }
-                check.set_state(CandidatePairState::InProgress);
-                return self.mut_check_by_id(check_id);
+            let Some((have_stun_request, have_remote_credentials)) =
+                self.check_by_id(check_id).map(|check| {
+                    (
+                        check.stun_request.is_some(),
+                        check.remote_credentials.is_some(),
+                    )
+                })
+            else {
+                continue;
+            };
+            // Don't trigger this check if there is already a STUN request in progress.
+            // Can happen on remote input if the same check is triggered while the check is
+            // sent to the peer.
+            if have_stun_request {
+                continue;
             }
+            // Without the remote credentials, no request can be constructed for this check yet.
+            // Keep the check on the triggered queue (and in its current state) so that it is
+            // retried once the remote credentials arrive.
+            if !have_remote_credentials {
+                trace!("triggered check {check_id} has no remote credentials yet");
+                self.triggered.push_back(check_id);
+                return None;
+            }
+            if let Some(check) = self.mut_check_by_id(check_id) {
+                check.set_state(CandidatePairState::InProgress);
+            }
+            return self.mut_check_by_id(check_id);
         }
         None
     }
@@ -2712,9 +2754,6 @@ impl ConnCheckListSet {
         now: Instant,
         ignorable: &mut Option<RecvIgnorable>,
     ) -> HandleRecvReply<T> {
-        if !self.checklists[checklist_i].pending_recv.is_empty() {
-            panic!("Previous data has not been completely handled yet");
-        }
         let (agent_id, checklist_i) = self.checklists[checklist_i]
             .find_agent_for_5tuple(transmit.transport, transmit.to, transmit.from)
             .map(|agent| (agent.0, checklist_i))
@@ -3426,6 +3465,7 @@ impl ConnCheckListSet {
     }
 
     #[tracing::instrument(
+        level = "debug",
         skip(self, response),
         fields(
             checklist_id = self.checklists[checklist_i].checklist_id,
@@ -3760,6 +3800,18 @@ impl ConnCheckListSet {
         {
             return;
         }
+        // a local candidate still references the same agent (e.g. after an ICE restart that
+        // keeps the local candidates), do not remove yet.  Any future check generated from that
+        // local candidate will reuse this agent.
+        if checklist.local_candidates.iter().any(|local| {
+            if let LocalCandidateVariant::Agent(agent_id) = local.variant {
+                agent_id == check_agent_id
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
 
         let Some(agent) = checklist.remove_agent_by_id(check_agent_id) else {
             return;
@@ -4000,7 +4052,7 @@ impl ConnCheckListSet {
                                 checklist.agents.iter_mut().find(|a| {
                                     a.agent.transport() == TransportType::Tcp
                                         && a.agent.local_addr() == pending.relayed_addr
-                                        && a.agent.remote_addr().unwrap() == pending.peer_addr
+                                        && a.agent.remote_addr() == Some(pending.peer_addr)
                                 }) {
                                 local_agent.id
                             } else {
@@ -4705,6 +4757,8 @@ impl ConnCheckListSet {
         for checklist_i in 0..self.checklists.len() {
             let checklist = &mut self.checklists[checklist_i];
             let checklist_id = checklist.checklist_id;
+            // the checklist is going away so no local candidate can keep an agent alive.
+            checklist.local_candidates.clear();
             let mut checks = VecDeque::new();
             core::mem::swap(&mut checks, &mut checklist.pairs);
             for check in checks {
@@ -4732,12 +4786,19 @@ impl ConnCheckListSet {
                         });
                     }
                     TransportType::Tcp => {
+                        let Some(remote_addr) = agent.remote_addr() else {
+                            warn!(
+                                "TCP STUN agent with local address {} has no remote address, not removing socket",
+                                agent.local_addr()
+                            );
+                            continue;
+                        };
                         self.pending_remove_sockets.push_back(CheckListSetSocket {
                             checklist_id,
                             component_id: 1, // FIXME
                             transport: agent.transport(),
                             local_addr: agent.local_addr(),
-                            remote_addr: agent.remote_addr().unwrap(),
+                            remote_addr,
                         });
                     }
                 }
@@ -4770,7 +4831,7 @@ impl ConnCheckListSet {
             return;
         };
 
-        let (agent_id, _) = checklist.find_or_create_udp_agent(&local, None);
+        let (agent_id, _) = checklist.find_or_create_agent(&local, to, None);
 
         self.pending_messages
             .push_front(CheckListSetPendingMessage {
@@ -5013,7 +5074,8 @@ mod tests {
         tcp::TurnClientTcp,
         types::{
             TurnCredentials,
-            message::{ALLOCATE, CHANNEL_BIND, CONNECT, CONNECTION_BIND, CREATE_PERMISSION},
+            attribute::{Data as TurnData, XorPeerAddress},
+            message::{ALLOCATE, CHANNEL_BIND, CONNECT, CONNECTION_BIND, CREATE_PERMISSION, DATA},
         },
         udp::TurnClientUdp,
     };
@@ -5757,6 +5819,7 @@ mod tests {
         ice_lite: bool,
         trickle_ice: bool,
         controlling: bool,
+        set_remote_credentials: bool,
         local_peer_builder: PeerBuilder,
         remote_peer_builder: PeerBuilder,
     }
@@ -5769,6 +5832,7 @@ mod tests {
                 ice_lite: false,
                 trickle_ice: false,
                 controlling: true,
+                set_remote_credentials: true,
                 local_peer_builder: Peer::builder()
                     .foundation("0")
                     .local_credentials(local_credentials.clone())
@@ -5799,6 +5863,14 @@ mod tests {
             self
         }
 
+        /// Whether the remote credentials are known to the checklist when built.  Not knowing
+        /// the remote credentials is a normal occurrence with trickle ICE where a peer's
+        /// connectivity check can arrive before its credentials.
+        fn set_remote_credentials(mut self, set_remote_credentials: bool) -> Self {
+            self.set_remote_credentials = set_remote_credentials;
+            self
+        }
+
         fn local_candidate(mut self, candidate: Candidate) -> Self {
             self.local_peer_builder.candidate = Some(candidate);
             self
@@ -5818,7 +5890,9 @@ mod tests {
             let remote_peer = self.remote_peer_builder.build();
 
             local_list.set_local_credentials(local_peer.local_credentials.clone().unwrap());
-            local_list.set_remote_credentials(local_peer.remote_credentials.clone().unwrap());
+            if self.set_remote_credentials {
+                local_list.set_remote_credentials(local_peer.remote_credentials.clone().unwrap());
+            }
             if !self.trickle_ice {
                 local_list.add_local_candidate(local_peer.candidate.clone());
                 local_list.add_remote_candidate(remote_peer.candidate.clone());
@@ -7537,6 +7611,140 @@ mod tests {
         };
     }
 
+    /// A controlled agent can receive a nominating (USE-CANDIDATE) binding request before the
+    /// remote credentials have been signalled.  The resulting triggered check cannot be
+    /// performed until the remote credentials arrive and must not be lost in the meantime.
+    #[test]
+    fn conncheck_trickle_ice_nominating_check_before_remote_credentials() {
+        let _log = crate::tests::test_init_log();
+        let mut state = FineControl::builder()
+            .controlling(false)
+            .trickle_ice(true)
+            .set_remote_credentials(false)
+            .build();
+        let now = Instant::ZERO;
+
+        let local_candidate = state.local.peer.candidate.clone();
+        state.local_list().add_local_candidate(local_candidate);
+        assert!(state.local_list().remote_credentials().is_none());
+
+        let mut remote_agent = StunAgent::builder(
+            state.remote.candidate.transport_type,
+            state.remote.candidate.base_address,
+        )
+        .build();
+        let to = state.local.peer.candidate.base_address;
+        let transmit = remote_generate_check(&state.remote, &mut remote_agent, to, true, true, now);
+
+        info!("sending nominating prflx request without any remote credentials");
+        let reply = state.local.checklist_set.incoming_data(
+            state.local.checklist_id,
+            1,
+            transmit,
+            now,
+            &mut None,
+        );
+        assert!(reply.handled);
+
+        // response to the prflx request
+        let Some(transmit) = state.local.checklist_set.poll_transmit(now) else {
+            unreachable!();
+        };
+        let response = Message::from_bytes(&transmit.transmit.data).unwrap();
+        assert!(response.has_class(MessageClass::Success));
+        assert!(remote_agent.handle_stun_message_with_time(&response, transmit.transmit.from, now));
+
+        let mut peer_reflexive_remote = state.remote.candidate.clone();
+        peer_reflexive_remote.candidate_type = CandidateType::PeerReflexive;
+        // XXX: implementation detail...
+        peer_reflexive_remote.foundation = String::from("rflx");
+        let pair = CandidatePair::new(state.local.peer.candidate.clone(), peer_reflexive_remote);
+
+        let nominate_check = state
+            .local_list()
+            .matching_check(&pair, Nominate::True)
+            .unwrap();
+        assert_eq!(nominate_check.state(), CandidatePairState::Waiting);
+        let check_id = nominate_check.conncheck_id;
+        let check_pair = nominate_check.pair.clone();
+        assert!(state.local_list().is_triggered(&check_pair));
+
+        // polling without any remote credentials cannot perform the triggered check and must
+        // not lose it either.
+        let now = wait_advance(&mut state.local.checklist_set, now);
+        let CheckListSetPollRet::WaitUntil(_) = state.local.checklist_set.poll(now) else {
+            unreachable!();
+        };
+        assert!(state.local.checklist_set.poll_transmit(now).is_none());
+        let nominate_check = state.local_list().check_by_id(check_id).unwrap();
+        assert_eq!(nominate_check.state(), CandidatePairState::Waiting);
+        assert!(state.local_list().is_triggered(&check_pair));
+
+        // the remote credentials arrive
+        info!("remote credentials set");
+        let remote_credentials = state.remote.local_credentials.clone().unwrap();
+        state.set_remote_credentials(remote_credentials);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connecting),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
+        // the triggered check is now performed and nominates the pair
+        info!("perform triggered nominating check");
+        send_next_check_and_response(&state.local.peer, &state.remote)
+            .perform(&mut state.local.checklist_set, now);
+        let nominate_check = state.local_list().check_by_id(check_id).unwrap();
+        assert_eq!(nominate_check.state(), CandidatePairState::Succeeded);
+        assert!(nominate_check.nominate());
+        assert_eq!(state.local_list().state(), CheckListState::Completed);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::SelectedPair(_cid, _selected_pair),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        assert!(matches!(
+            state.local.checklist_set.poll(now),
+            CheckListSetPollRet::Completed
+        ));
+
+        state.local.checklist_set.close(now);
+        let CheckListSetPollRet::RemoveSocket {
+            checklist_id: _,
+            component_id: 1,
+            transport: TransportType::Udp,
+            local_addr,
+            remote_addr: _,
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        assert_eq!(local_addr, pair.local.base_address);
+        let CheckListSetPollRet::Closed = state.local.checklist_set.poll(now) else {
+            unreachable!();
+        };
+    }
+
     fn turn_allocate(
         client: &mut TurnClient,
         server: &mut TurnServer,
@@ -7814,6 +8022,100 @@ mod tests {
     fn turn_tcp_allocate_udp() {
         let _log = crate::tests::test_init_log();
         turn_allocate_udp(TransportType::Tcp);
+    }
+
+    #[test]
+    fn turn_tcp_multiple_data_indications_in_one_recv() {
+        let _log = crate::tests::test_init_log();
+        let local_addr = "127.0.0.1:1".parse::<SocketAddr>().unwrap();
+        let turn_addr = "127.0.0.1:3478".parse::<SocketAddr>().unwrap();
+        let turn_alloc_addr = "127.0.0.1:3000".parse::<SocketAddr>().unwrap();
+        let credentials = TurnCredentials::new("tuser", "tpass");
+        let mut state = FineControl::builder()
+            .local_candidate(
+                Candidate::builder(
+                    1,
+                    CandidateType::Relayed,
+                    TransportType::Udp,
+                    "0",
+                    turn_alloc_addr,
+                )
+                .priority(8000)
+                .base_address(turn_alloc_addr)
+                .related_address(local_addr)
+                .build(),
+            )
+            .trickle_ice(true)
+            .build();
+        let peer_addr = state.remote.candidate.address;
+        let now = Instant::ZERO;
+        let mut turn_server = TurnServer::new(TransportType::Tcp, turn_addr, "realm".to_owned());
+        turn_server.add_user(
+            credentials.username().to_owned(),
+            credentials.password().to_owned(),
+        );
+        let mut turn_client = TurnClient::from(TurnClientTcp::allocate(
+            local_addr,
+            turn_addr,
+            turn_client_proto::api::TurnConfig::new(credentials),
+        ));
+        let now = turn_allocate(&mut turn_client, &mut turn_server, turn_alloc_addr, now);
+        let remote_candidate = state.remote.candidate.clone();
+        state.local_list().add_remote_candidate(remote_candidate);
+        let local_candidate = state.local.peer.candidate.clone();
+        state
+            .local_list()
+            .add_local_gathered_candidate(GatheredCandidate {
+                candidate: local_candidate,
+                turn_agent: Some(Box::new(turn_client)),
+            });
+        let now = match state.local.checklist_set.poll(now) {
+            CheckListSetPollRet::WaitUntil(now) => now,
+            ret => panic!("unexpected poll: {ret:?}"),
+        };
+        let now = set_handle_permission(&mut state.local.checklist_set, &mut turn_server, now);
+
+        let agent_id = state
+            .local_list()
+            .find_agent_for_5tuple(TransportType::Udp, turn_alloc_addr, peer_addr)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| {
+                state
+                    .local_list()
+                    .add_agent_for_5tuple(TransportType::Udp, turn_alloc_addr, peer_addr, None)
+                    .0
+            });
+        state
+            .local_list()
+            .mut_agent_by_id(agent_id)
+            .unwrap()
+            .validated_peer(peer_addr);
+
+        let payloads = [vec![1; 160], vec![2; 1296], vec![3; 1200]];
+        let mut tcp_data = Vec::new();
+        for payload in &payloads {
+            let mut msg = Message::builder_indication(DATA, MessageWriteVec::new());
+            msg.add_attribute(&XorPeerAddress::new(peer_addr, msg.transaction_id()))
+                .unwrap();
+            msg.add_attribute(&TurnData::new(payload)).unwrap();
+            tcp_data.extend(msg.finish());
+        }
+
+        let transmit = Transmit::new(tcp_data, TransportType::Tcp, turn_addr, local_addr);
+        let reply = state.local.checklist_set.incoming_data(
+            state.local.checklist_id,
+            1,
+            transmit,
+            now,
+            &mut None,
+        );
+        assert!(reply.have_more_data);
+        for payload in payloads {
+            let received = state.local_list().poll_recv().unwrap();
+            assert_eq!(received.component_id, 1);
+            assert_eq!(received.data, payload);
+        }
+        assert!(state.local_list().poll_recv().is_none());
     }
 
     #[test]
@@ -9587,6 +9889,140 @@ mod tests {
         assert_eq!(set.tie_breaker(), 42);
     }
 
+    fn consent_check_tcp_set(
+        local_addr: SocketAddr,
+        local_creds: Credentials,
+        remote_creds: Credentials,
+    ) -> (ConnCheckListSet, usize, Candidate) {
+        let mut set = ConnCheckListSet::builder(42, true).build();
+        let cl_id = set.new_list();
+        let cl = set.mut_list(cl_id).unwrap();
+        cl.add_component(1);
+        cl.set_local_credentials(local_creds);
+        cl.set_remote_credentials(remote_creds);
+
+        let local_cand =
+            Candidate::builder(1, CandidateType::Host, TransportType::Tcp, "0", local_addr)
+                .priority(1234)
+                .tcp_type(TcpType::Active)
+                .base_address(local_addr)
+                .build();
+        (set, cl_id, local_cand)
+    }
+
+    fn poll_until_closed(set: &mut ConnCheckListSet, now: Instant) -> Vec<CheckListSetSocket> {
+        let mut removed = Vec::new();
+        loop {
+            match set.poll(now) {
+                CheckListSetPollRet::RemoveSocket {
+                    checklist_id,
+                    component_id,
+                    transport,
+                    local_addr,
+                    remote_addr,
+                } => removed.push(CheckListSetSocket {
+                    checklist_id,
+                    component_id,
+                    transport,
+                    local_addr,
+                    remote_addr,
+                }),
+                CheckListSetPollRet::Closed => break,
+                CheckListSetPollRet::Completed | CheckListSetPollRet::Event { .. } => (),
+                other => panic!("unexpected poll return {other:?}"),
+            }
+        }
+        removed
+    }
+
+    #[test]
+    fn consent_check_tcp_agent_has_remote_address() {
+        let _log = crate::tests::test_init_log();
+        let local_creds = Credentials::new("lufrag".into(), "lpwd".into());
+        let remote_creds = Credentials::new("rufrag".into(), "rpwd".into());
+        let local_addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let (mut set, cl_id, local_cand) =
+            consent_check_tcp_set(local_addr, local_creds.clone(), remote_creds.clone());
+        let now = Instant::ZERO;
+
+        let request = generate_binding_request(1234, false, true, 42, local_creds, remote_creds)
+            .unwrap()
+            .to_vec();
+        set.add_consent_check(local_cand, cl_id, 1, request, remote_addr);
+
+        let cl = set.mut_list(cl_id).unwrap();
+        assert_eq!(cl.agents.len(), 1);
+        let agent = &cl.agents[0].agent;
+        assert_eq!(agent.transport(), TransportType::Tcp);
+        assert_eq!(agent.local_addr(), local_addr);
+        assert_eq!(agent.remote_addr(), Some(remote_addr));
+
+        let Some(transmit) = set.poll_transmit(now) else {
+            panic!("Expected a consent check transmit");
+        };
+        assert_eq!(transmit.transmit.transport, TransportType::Tcp);
+        assert_eq!(transmit.transmit.from, local_addr);
+        assert_eq!(transmit.transmit.to, remote_addr);
+
+        // closing must not panic and must remove the socket the agent was using.
+        set.close(now);
+        let removed = poll_until_closed(&mut set, now);
+        assert!(removed.iter().any(|socket| {
+            socket.transport == TransportType::Tcp
+                && socket.local_addr == local_addr
+                && socket.remote_addr == remote_addr
+        }));
+    }
+
+    #[test]
+    fn consent_check_tcp_reuses_existing_agent() {
+        let _log = crate::tests::test_init_log();
+        let local_creds = Credentials::new("lufrag".into(), "lpwd".into());
+        let remote_creds = Credentials::new("rufrag".into(), "rpwd".into());
+        let local_addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let (mut set, cl_id, local_cand) =
+            consent_check_tcp_set(local_addr, local_creds.clone(), remote_creds.clone());
+        let now = Instant::ZERO;
+
+        // the agent that the TCP connectivity check would have created for the selected pair.
+        let cl = set.mut_list(cl_id).unwrap();
+        let (conncheck_agent_id, _) =
+            cl.add_agent_for_5tuple(TransportType::Tcp, local_addr, remote_addr, None);
+
+        for _ in 0..3 {
+            let request = generate_binding_request(
+                1234,
+                false,
+                true,
+                42,
+                local_creds.clone(),
+                remote_creds.clone(),
+            )
+            .unwrap()
+            .to_vec();
+            set.add_consent_check(local_cand.clone(), cl_id, 1, request, remote_addr);
+            assert!(set.poll_transmit(now).is_some());
+        }
+
+        // consent checks must reuse the agent for the same 5-tuple instead of adding a new agent
+        // for every check.
+        let cl = set.mut_list(cl_id).unwrap();
+        assert_eq!(cl.agents.len(), 1);
+        assert_eq!(cl.agents[0].id, conncheck_agent_id);
+
+        // a different remote peer requires a different TCP agent.
+        let other_remote: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let request = generate_binding_request(1234, false, true, 42, local_creds, remote_creds)
+            .unwrap()
+            .to_vec();
+        set.add_consent_check(local_cand, cl_id, 1, request, other_remote);
+        let cl = set.mut_list(cl_id).unwrap();
+        assert_eq!(cl.agents.len(), 2);
+        assert_eq!(cl.agents[1].agent.remote_addr(), Some(other_remote));
+    }
+
     #[test]
     fn restart_single_check_change_credentials() {
         let _log = crate::tests::test_init_log();
@@ -10041,6 +10477,120 @@ mod tests {
             unreachable!();
         };
         assert_eq!(local_addr, new_pair.local.base_address);
+        let CheckListSetPollRet::Closed = state.local.checklist_set.poll(now) else {
+            unreachable!();
+        };
+    }
+
+    #[test]
+    fn restart_keep_local_candidates_with_in_progress_checks() {
+        let _log = crate::tests::test_init_log();
+        let mut state = FineControl::builder().build();
+        let mut now = Instant::ZERO;
+        assert_eq!(state.local.component_id, 1);
+
+        let local2 = Peer::builder()
+            .foundation("1")
+            .component_id(1)
+            .priority(state.local.peer.candidate.priority - 1)
+            .local_addr("127.0.0.2:3".parse().unwrap())
+            .build();
+        state
+            .local_list()
+            .add_local_candidate(local2.candidate.clone());
+
+        let pair1 = CandidatePair::new(
+            state.local.peer.candidate.clone(),
+            state.remote.candidate.clone(),
+        );
+        let pair2 = CandidatePair::new(local2.candidate.clone(), state.remote.candidate.clone());
+        for pair in [&pair1, &pair2] {
+            let check = state
+                .local_list()
+                .matching_check(pair, Nominate::False)
+                .unwrap();
+            assert_eq!(check.state(), CandidatePairState::Frozen);
+        }
+
+        // Restart before any pair has been nominated.  All the existing checks are removed but
+        // the local candidates (and so the STUN agents and sockets they reference) are retained.
+        let restart = RestartStreamConfig::new();
+        assert!(!restart.remove_local_candidates());
+        let remove = state.local_list().restart(&restart);
+        state
+            .local
+            .checklist_set
+            .remove_checks(state.local.checklist_id, remove, now);
+        let remote_credentials = Credentials::new("ruser2".to_owned(), "rpass2".to_owned());
+        state.set_remote_credentials(remote_credentials);
+        let local_credentials = state.local_list().local_credentials().clone();
+        state.local.peer.local_credentials = Some(local_credentials.clone());
+        state.remote.remote_credentials = Some(local_credentials);
+        let remote_candidate = state.remote.candidate.clone();
+        state.local_list().add_remote_candidate(remote_candidate);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connecting),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
+        // the checks regenerated from the retained local candidates must still reference a
+        // usable STUN agent.
+        let mut pending_checks = vec![];
+        for pair in [&pair1, &pair2] {
+            let check = state
+                .local_list()
+                .matching_check(pair, Nominate::False)
+                .unwrap();
+            let check_id = check.conncheck_id;
+            let mut response = send_next_check_and_response2(pair.local.clone(), &state.remote);
+            let transmit = response.send(&mut state.local.checklist_set, now);
+            let check = state.local_list().check_by_id(check_id).unwrap();
+            assert_eq!(check.state(), CandidatePairState::InProgress);
+            pending_checks.push((response, transmit));
+            now = wait_advance(&mut state.local.checklist_set, now);
+        }
+        for (mut response, transmit) in pending_checks {
+            response.response(&mut state.local.checklist_set, transmit, now);
+        }
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
+        state.check_nomination(&pair1, now);
+
+        state.local.checklist_set.close(now);
+
+        let CheckListSetPollRet::RemoveSocket {
+            checklist_id: _,
+            component_id: 1,
+            transport: TransportType::Udp,
+            local_addr,
+            remote_addr: _,
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        assert_eq!(local_addr, pair1.local.base_address);
+        let CheckListSetPollRet::RemoveSocket {
+            checklist_id: _,
+            component_id: 1,
+            transport: TransportType::Udp,
+            local_addr,
+            remote_addr: _,
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        assert_eq!(local_addr, pair2.local.base_address);
         let CheckListSetPollRet::Closed = state.local.checklist_set.poll(now) else {
             unreachable!();
         };
