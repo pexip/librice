@@ -28,7 +28,7 @@ use crate::component::ComponentConnectionState;
 use crate::gathering::GatheredCandidate;
 use crate::rand::generate_random_ice_string;
 use crate::stream::RestartStreamConfig;
-use crate::tcp::TcpBuffer;
+use crate::tcp::{TcpBuffer, TcpPush};
 use crate::turn::TurnClient;
 use byteorder::{BigEndian, ByteOrder};
 use rice_stun_types::attribute::{IceControlled, IceControlling, Priority, UseCandidate};
@@ -37,7 +37,9 @@ use stun_proto::agent::{StunAgent, StunAgentPollRet, StunError, Transmit};
 use stun_proto::types::attribute::*;
 use stun_proto::types::data::Data;
 use stun_proto::types::message::*;
-use turn_client_proto::api::{Socket5Tuple, TransmitBuild, TurnEvent, TurnPollRet, TurnRecvRet};
+use turn_client_proto::api::{
+    BindChannelError, Socket5Tuple, TransmitBuild, TurnEvent, TurnPollRet, TurnRecvRet,
+};
 use turn_client_proto::prelude::*;
 
 use tracing::{debug, info, trace, warn};
@@ -556,6 +558,7 @@ pub struct ConnCheckList {
     pending_turn_permissions: VecDeque<(StunAgentId, TransportType, IpAddr)>,
     pending_recv: VecDeque<PendingRecv>,
     pending_turn_tcp_connect: Vec<PendingTurnTcp>,
+    pending_turn_bind_channel: VecDeque<PendingTurnBindChannel>,
 }
 
 #[derive(Debug)]
@@ -575,6 +578,13 @@ struct PendingTurnTcp {
     peer_addr: SocketAddr,
     turn_connect_id: Option<u32>,
     allocated: bool,
+}
+
+#[derive(Debug)]
+struct PendingTurnBindChannel {
+    turn_id: StunAgentId,
+    transport: TransportType,
+    peer_addr: SocketAddr,
 }
 
 fn candidate_is_same_connection(a: &Candidate, b: &Candidate) -> bool {
@@ -704,6 +714,7 @@ impl ConnCheckList {
             pending_turn_permissions: VecDeque::new(),
             pending_recv: VecDeque::new(),
             pending_turn_tcp_connect: Vec::new(),
+            pending_turn_bind_channel: VecDeque::new(),
         }
     }
 
@@ -1797,6 +1808,19 @@ impl ConnCheckList {
             "adding valid {conncheck_id}"
         );
         self.valid.push(conncheck_id);
+        if let Some((_id, state)) = self.component_ids.iter_mut().find(|(id, state)| {
+            *id == pair.local.component_id
+                && !matches!(
+                    state,
+                    ComponentConnectionState::Completed | ComponentConnectionState::Connected
+                )
+        }) {
+            *state = ComponentConnectionState::Connected;
+            self.events.push_front(ConnCheckEvent::ComponentState(
+                pair.local.component_id,
+                ComponentConnectionState::Connected,
+            ));
+        }
     }
 
     #[tracing::instrument(
@@ -1971,19 +1995,26 @@ impl ConnCheckList {
                             return component_ids_selected;
                         };
                         let turn = {
-                            let ret = self
-                                .turn_client_by_allocated_address(
-                                    pair.local.transport_type,
-                                    pair.local.base_address,
-                                )
-                                .map(|(_turn_id, client)| SelectedTurn {
-                                    transport: client.transport(),
-                                    local_addr: client.local_addr(),
-                                    remote_addr: client.remote_addr(),
-                                });
+                            let turn_client = self.turn_client_by_allocated_address(
+                                pair.local.transport_type,
+                                pair.local.base_address,
+                            );
+                            let ret = turn_client.map(|(_turn_id, client)| SelectedTurn {
+                                transport: client.transport(),
+                                local_addr: client.local_addr(),
+                                remote_addr: client.remote_addr(),
+                            });
                             if pair.local.candidate_type == CandidateType::Relayed {
                                 trace!("turn clients: {:?}", self.turn_clients);
                                 debug_assert!(ret.is_some());
+                                let turn_client =
+                                    turn_client.expect("No TURN client for a relayed candidate?!");
+                                self.pending_turn_bind_channel
+                                    .push_front(PendingTurnBindChannel {
+                                        turn_id: turn_client.0,
+                                        transport: pair.local.transport_type,
+                                        peer_addr: pair.remote.address,
+                                    });
                             }
                             ret
                         };
@@ -1994,7 +2025,7 @@ impl ConnCheckList {
                         debug!("trying to signal component {:?}", component_id);
                         self.events.push_front(ConnCheckEvent::ComponentState(
                             component_id,
-                            ComponentConnectionState::Connected,
+                            ComponentConnectionState::Completed,
                         ));
                     }
                     component_ids_selected.push(check_component_id);
@@ -2275,6 +2306,20 @@ impl ConnCheckList {
             checks: remove_pairs,
         }
     }
+
+    pub(crate) fn best_valid_pair(
+        &self,
+        component_id: usize,
+    ) -> Option<(&CandidatePair, StunAgentId)> {
+        self.nominated
+            .iter()
+            .map(|(nominate_id, _pair)| nominate_id)
+            .chain(self.valid.iter())
+            .filter_map(|&valid_id| self.check_by_id(valid_id))
+            .filter(|check| check.pair.local.component_id == component_id)
+            .max_by_key(|check| check.pair.priority(self.controlling))
+            .map(|check| (&check.pair, check.agent_id().unwrap()))
+    }
 }
 
 pub(crate) struct RestartRemoveChecks {
@@ -2491,16 +2536,16 @@ impl ConnCheckListSet {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_stun<T: AsRef<[u8]>>(
+    fn handle_stun(
         &mut self,
         checklist_i: usize,
-        msg: Message<'_>,
-        transmit: &Transmit<T>,
+        transmit: &Transmit<Message<'_>>,
         agent_id: StunAgentId,
         turn_id: Option<(StunAgentId, SocketAddr)>,
         ignorable: &mut Option<RecvIgnorable>,
         now: Instant,
     ) -> bool {
+        let msg = transmit.data;
         debug!("received STUN message {msg}");
         if msg.is_response() {
             match self.checklists[checklist_i]
@@ -2626,6 +2671,70 @@ impl ConnCheckListSet {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn incoming_data_with_agent<T: AsRef<[u8]> + core::fmt::Debug>(
+        &mut self,
+        checklist_i: usize,
+        component_id: usize,
+        transmit: Transmit<T>,
+        agent_id: StunAgentId,
+        turn_client_id: Option<(StunAgentId, SocketAddr)>,
+        now: Instant,
+        ignorable: &mut Option<RecvIgnorable>,
+    ) -> HandleRecvReply<T> {
+        match Message::from_bytes(transmit.data.as_ref()) {
+            Ok(msg) => {
+                let msg_transmit =
+                    Transmit::new(msg, transmit.transport, transmit.from, transmit.to);
+                if self.handle_stun(
+                    checklist_i,
+                    &msg_transmit,
+                    agent_id,
+                    turn_client_id,
+                    ignorable,
+                    now,
+                ) {
+                    return HandleRecvReply {
+                        handled: true,
+                        have_more_data: false,
+                        data: None,
+                    };
+                }
+            }
+            Err(_) => {
+                if let Some(agent) = self.checklists[checklist_i].agent_by_id(agent_id) {
+                    if agent.is_validated_peer(transmit.from) {
+                        let cl_id = self.checklists[checklist_i].checklist_id;
+
+                        if self.is_local_consent_revoked(cl_id, component_id) {
+                            trace!(
+                                "dropping incoming data from {:?}: \
+                                 local consent revoked for checklist {cl_id} \
+                                 component {component_id}",
+                                transmit.from
+                            );
+
+                            return HandleRecvReply {
+                                handled: true,
+                                ..Default::default()
+                            };
+                        }
+
+                        return HandleRecvReply {
+                            handled: false,
+                            have_more_data: false,
+                            data: Some(DataAndRange {
+                                range: 0..transmit.data.as_ref().len(),
+                                data: transmit.data,
+                            }),
+                        };
+                    }
+                }
+            }
+        }
+        HandleRecvReply::default()
+    }
+
     #[tracing::instrument(
         name = "incoming_data_or_stun",
         level = "trace",
@@ -2670,124 +2779,99 @@ impl ConnCheckListSet {
             });
 
         match transmit.transport {
-            TransportType::Udp => match Message::from_bytes(transmit.data.as_ref()) {
-                Ok(msg) => {
-                    if self.handle_stun(
-                        checklist_i,
-                        msg,
-                        &transmit,
-                        agent_id,
-                        turn_client_id,
-                        ignorable,
-                        now,
-                    ) {
-                        return HandleRecvReply {
-                            handled: true,
-                            have_more_data: false,
-                            data: None,
-                        };
-                    }
-                }
-                Err(_) => {
-                    if let Some(agent) = self.checklists[checklist_i].agent_by_id(agent_id) {
-                        if agent.is_validated_peer(transmit.from) {
-                            let cl_id = self.checklists[checklist_i].checklist_id;
-
-                            if self.is_local_consent_revoked(cl_id, component_id) {
-                                trace!(
-                                    "dropping incoming data from {:?}: \
-                                     local consent revoked for checklist {cl_id} \
-                                     component {component_id}",
-                                    transmit.from
-                                );
-
-                                return HandleRecvReply {
-                                    handled: true,
-                                    ..Default::default()
-                                };
-                            }
-
-                            return HandleRecvReply {
-                                handled: false,
-                                have_more_data: false,
-                                data: Some(DataAndRange {
-                                    range: 0..transmit.data.as_ref().len(),
-                                    data: transmit.data,
-                                }),
-                            };
-                        }
-                    }
-                }
-            },
+            TransportType::Udp => self.incoming_data_with_agent(
+                checklist_i,
+                component_id,
+                transmit,
+                agent_id,
+                turn_client_id,
+                now,
+                ignorable,
+            ),
             TransportType::Tcp => {
                 // TODO: can potentially return a subset of the original data if the tcp buffer
                 // is empty and the incoming data contains at least one message.
-                let cl_id = self.checklists[checklist_i].checklist_id;
-                let local_consent_revoked = self.is_local_consent_revoked(cl_id, component_id);
                 let mut tcp_buffer = self.checklists[checklist_i]
                     .tcp_buffers
                     .entry((transmit.to, transmit.from))
                     .or_default();
-                tcp_buffer.push_data(transmit.data.as_ref());
-
-                let mut handled = false;
+                let mut handled;
                 let mut have_more_data = false;
-                while let Some(data) = tcp_buffer.pull_data() {
-                    match Message::from_bytes(&data) {
-                        Ok(msg) => {
-                            if self.handle_stun(
-                                checklist_i,
-                                msg,
-                                &transmit,
-                                agent_id,
-                                turn_client_id,
-                                ignorable,
-                                now,
-                            ) {
-                                handled = true;
-                            }
-                            if let Some(ignorable) = ignorable.take() {
-                                self.send_ignorable_error(ignorable);
-                            }
-                        }
-                        Err(_) => {
-                            if local_consent_revoked {
-                                trace!(
-                                    "dropping incoming data from {:?}: \
-                                     local consent revoked for checklist {cl_id} \
-                                     component {component_id}",
-                                    transmit.from
-                                );
-                                continue;
-                            }
+                let mut pending_range = None;
+                if let TcpPush::Subslice(range) = tcp_buffer.push_data(transmit.data.as_ref()) {
+                    let tcp_buffer_empty = tcp_buffer.is_empty();
+                    let data_transmit = Transmit::new(
+                        &transmit.data.as_ref()[range.start..range.end],
+                        transmit.transport,
+                        transmit.from,
+                        transmit.to,
+                    );
+                    let ret = self.incoming_data_with_agent(
+                        checklist_i,
+                        component_id,
+                        data_transmit,
+                        agent_id,
+                        turn_client_id,
+                        now,
+                        ignorable,
+                    );
+                    handled = ret.handled;
+                    have_more_data = !tcp_buffer_empty;
+                    if let Some(ignorable) = ignorable.take() {
+                        self.send_ignorable_error(ignorable);
+                    }
+                    pending_range = ret.data.map(|_| range);
+                    tcp_buffer = self.checklists[checklist_i]
+                        .tcp_buffers
+                        .get_mut(&(transmit.to, transmit.from))
+                        .unwrap();
+                } else {
+                    handled = true;
+                }
 
-                            let checklist = &mut self.checklists[checklist_i];
-                            if let Some(agent) = checklist.agent_by_id(agent_id) {
-                                if agent.is_validated_peer(transmit.from) {
-                                    have_more_data = true;
-                                    checklist
-                                        .pending_recv
-                                        .push_back(PendingRecv { component_id, data });
-                                }
-                            }
-                        }
+                while let Some(data) = tcp_buffer.pull_data() {
+                    let data_transmit =
+                        Transmit::new(&data, transmit.transport, transmit.from, transmit.to);
+                    let ret = self.incoming_data_with_agent(
+                        checklist_i,
+                        component_id,
+                        data_transmit,
+                        agent_id,
+                        turn_client_id,
+                        now,
+                        ignorable,
+                    );
+                    handled |= ret.handled;
+                    if let Some(ignorable) = ignorable.take() {
+                        self.send_ignorable_error(ignorable);
+                    }
+                    if ret.data.is_some() {
+                        let checklist = &mut self.checklists[checklist_i];
+                        have_more_data = true;
+                        checklist
+                            .pending_recv
+                            .push_back(PendingRecv { component_id, data });
                     }
                     tcp_buffer = self.checklists[checklist_i]
                         .tcp_buffers
                         .get_mut(&(transmit.to, transmit.from))
                         .unwrap();
                 }
-                return HandleRecvReply {
-                    handled,
-                    have_more_data,
-                    data: None,
-                };
+                pending_range
+                    .map(|range| HandleRecvReply {
+                        handled,
+                        have_more_data,
+                        data: Some(DataAndRange {
+                            range,
+                            data: transmit.data,
+                        }),
+                    })
+                    .unwrap_or(HandleRecvReply {
+                        handled,
+                        have_more_data,
+                        data: None,
+                    })
             }
-        }
-        HandleRecvReply {
-            handled: false,
-            have_more_data: false,
-            data: None,
         }
     }
 
@@ -3870,6 +3954,26 @@ impl ConnCheckListSet {
             }
 
             let checklist = &mut self.checklists[self.checklist_i];
+            while let Some(pending) = checklist.pending_turn_bind_channel.pop_back() {
+                let Some(client) = checklist.mut_turn_client_by_id(pending.turn_id) else {
+                    continue;
+                };
+                match client
+                    .client
+                    .bind_channel(pending.transport, pending.peer_addr, now)
+                {
+                    Ok(()) | Err(BindChannelError::AlreadyExists) => (),
+                    Err(BindChannelError::ExpiredChannelExists(expiry)) => {
+                        warn!("channel bind will not succeed for {:?}", expiry - now);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Unhandled error attempting to bind channel over {} to {}: {err:?}",
+                            pending.transport, pending.peer_addr
+                        );
+                    }
+                }
+            }
             while let Some((turn_id, transport, remote_ip)) =
                 checklist.pending_turn_permissions.pop_back()
             {
@@ -3989,22 +4093,11 @@ impl ConnCheckListSet {
                     TurnPollRet::Closed => (),
                     TurnPollRet::WaitUntil(wait) => {
                         all_turn_closed = false;
-                        if wait == now {
-                            return CheckListSetPollRet::WaitUntil(
-                                wait.max(
-                                    self.last_send_time
-                                        .map(|last_send| last_send + self.timing_advance)
-                                        .unwrap_or(now),
-                                ),
-                            );
-                        }
-                        if wait < lowest_wait {
-                            lowest_wait = wait.max(
-                                self.last_send_time
-                                    .map(|last_send| last_send + self.timing_advance)
-                                    .unwrap_or(now),
-                            );
-                        }
+                        lowest_wait = wait.max(
+                            self.last_send_time
+                                .map(|last_send| last_send + self.timing_advance)
+                                .unwrap_or(now),
+                        );
                     }
                     TurnPollRet::TcpClose {
                         local_addr,
@@ -4048,6 +4141,8 @@ impl ConnCheckListSet {
             }
             let mut idx = 0;
             while let Some(client) = checklist.pending_delete_turn_clients.get_mut(idx) {
+                // ignore all events
+                while client.client.poll_event().is_some() {}
                 match client.client.poll(now) {
                     TurnPollRet::Closed => {
                         let client = checklist.pending_delete_turn_clients.remove(idx);
@@ -4174,45 +4269,12 @@ impl ConnCheckListSet {
                                     }
                                 }
                             }
-                        } else if let Some(client) = checklist.mut_turn_client_by_id(agent_id) {
-                            match client.client.poll(now) {
-                                TurnPollRet::WaitUntil(wait) => {
-                                    if wait < lowest_wait {
-                                        lowest_wait = wait.max(
-                                            self.last_send_time
-                                                .map(|last_send| last_send + self.timing_advance)
-                                                .unwrap_or(now),
-                                        );
-                                    }
-                                }
-                                TurnPollRet::Closed => (),
-                                TurnPollRet::TcpClose {
-                                    local_addr,
-                                    remote_addr,
-                                } => {
-                                    return CheckListSetPollRet::RemoveSocket {
-                                        checklist_id,
-                                        component_id: client.component_id,
-                                        transport: client.client.transport(),
-                                        local_addr,
-                                        remote_addr,
-                                    };
-                                }
-                                TurnPollRet::AllocateTcpSocket {
-                                    id: _,
-                                    socket: _,
-                                    peer_addr: _,
-                                } => unimplemented!(),
-                            }
                         } else {
-                            // The agent (or TURN client) the check references no longer exists.
-                            // Fail the check instead of aborting the process.
-                            warn!(
-                                "no STUN agent or TURN client with id {agent_id} for check {conncheck_id}, failing check"
-                            );
-                            checklist.check_cancel_retransmissions(conncheck_id);
                             let check = &mut checklist.pairs[idx];
-                            check.set_state(CandidatePairState::Failed);
+                            warn!(
+                                "Failed to retrieve stun agent for check {}",
+                                check.conncheck_id
+                            );
                         }
                     }
                 }
@@ -5013,7 +5075,7 @@ mod tests {
         types::{
             TurnCredentials,
             attribute::{Data as TurnData, XorPeerAddress},
-            message::{ALLOCATE, CONNECT, CONNECTION_BIND, CREATE_PERMISSION, DATA},
+            message::{ALLOCATE, CHANNEL_BIND, CONNECT, CONNECTION_BIND, CREATE_PERMISSION, DATA},
         },
         udp::TurnClientUdp,
     };
@@ -5874,7 +5936,13 @@ mod tests {
             assert_eq!(nominate_check.state(), CandidatePairState::Waiting);
             let pair = nominate_check.pair.clone();
             let check_id = nominate_check.conncheck_id;
+            let component_id = nominate_check.pair.local.component_id;
             assert!(self.local_list().is_triggered(&pair));
+
+            let (valid_pair, valid_agent_id) =
+                self.local_list().best_valid_pair(component_id).unwrap();
+            assert_eq!(valid_pair, &pair);
+            let valid_pair = valid_pair.clone();
 
             // perform one tick which will perform the nomination check
             send_next_check_and_response(&self.local.peer, &self.remote)
@@ -5885,17 +5953,23 @@ mod tests {
 
             // check list is done
             assert_eq!(self.local_list().state(), CheckListState::Completed);
+            assert_eq!(
+                self.local_list().best_valid_pair(component_id).unwrap(),
+                (&valid_pair, valid_agent_id)
+            );
 
             let CheckListSetPollRet::Event {
                 checklist_id: _,
-                event: ConnCheckEvent::SelectedPair(_cid, _selected_pair),
+                event: ConnCheckEvent::SelectedPair(_cid, selected_pair),
             } = self.local.checklist_set.poll(now)
             else {
                 unreachable!();
             };
+            assert_eq!(selected_pair.candidate_pair(), &valid_pair);
+            assert_eq!(selected_pair.stun_agent_id(), valid_agent_id);
             let CheckListSetPollRet::Event {
                 checklist_id: _,
-                event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+                event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
             } = self.local.checklist_set.poll(now)
             else {
                 unreachable!();
@@ -6117,6 +6191,14 @@ mod tests {
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
 
         state.check_nomination(&pair, now);
@@ -6190,6 +6272,14 @@ mod tests {
             .perform(&mut state.local.checklist_set, now);
         let triggered_check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(triggered_check.state(), CandidatePairState::Succeeded);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
         state.check_nomination(&pair, now);
@@ -6371,14 +6461,25 @@ mod tests {
             .unwrap();
         assert_eq!(check.state(), CandidatePairState::InProgress);
 
-        state.local.checklist_set.incoming_data(
+        let ret = state.local.checklist_set.incoming_data(
             state.local.checklist_id,
             1,
             response,
             now,
             &mut None,
         );
+        assert!(ret.handled);
+        assert!(!ret.have_more_data);
+        assert!(ret.data.is_none());
         error!("tcp replied");
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
         let CheckListSetPollRet::WaitUntil(_) = state.local.checklist_set.poll(now) else {
@@ -6415,7 +6516,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -6579,6 +6680,14 @@ mod tests {
         );
         error!("tcp replied");
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
         let CheckListSetPollRet::WaitUntil(_) = state.local.checklist_set.poll(now) else {
             unreachable!();
@@ -6599,13 +6708,16 @@ mod tests {
             unreachable!();
         };
 
-        state.local.checklist_set.incoming_data(
+        let ret = state.local.checklist_set.incoming_data(
             state.local.checklist_id,
             1,
             response,
             now,
             &mut None,
         );
+        assert!(ret.handled);
+        assert!(!ret.have_more_data);
+        assert!(ret.data.is_none());
 
         let CheckListSetPollRet::Event {
             checklist_id: _,
@@ -6616,7 +6728,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -6790,6 +6902,14 @@ mod tests {
         assert_eq!(nominated_check.state(), CandidatePairState::Waiting);
         let check_id = nominated_check.conncheck_id;
         info!("perform nominated check");
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
         let now = wait_advance(&mut state.local.checklist_set, now);
         send_next_check_and_response(&state.local.peer, &unknown_remote_peer)
             .perform(&mut state.local.checklist_set, now);
@@ -6807,7 +6927,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -6898,6 +7018,14 @@ mod tests {
 
         state.local_list().dump_check_state();
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
         send_next_check_and_response(&state.local.peer, &state.remote)
             .response_address(unknown_remote_peer.candidate.address)
@@ -6914,7 +7042,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -6995,6 +7123,14 @@ mod tests {
         assert_eq!(check.state(), CandidatePairState::Succeeded);
 
         state.local_list().dump_check_state();
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
         state.check_nomination(&pair, now);
@@ -7187,6 +7323,14 @@ mod tests {
         let triggered_check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(triggered_check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
         state.check_nomination(&pair, now);
 
@@ -7312,6 +7456,14 @@ mod tests {
         let triggered_check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(triggered_check.state(), CandidatePairState::InProgress);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
         state.check_nomination(&pair, now);
 
@@ -7430,6 +7582,14 @@ mod tests {
             .unwrap();
         assert_eq!(prflx_check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
         state.check_nomination(&pair, now);
 
@@ -7544,6 +7704,13 @@ mod tests {
 
         let CheckListSetPollRet::Event {
             checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
             event: ConnCheckEvent::SelectedPair(_cid, _selected_pair),
         } = state.local.checklist_set.poll(now)
         else {
@@ -7551,7 +7718,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -7755,6 +7922,14 @@ mod tests {
         let check_id = nominate_check.conncheck_id;
         assert!(state.local_list().is_triggered(&pair));
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         // perform one tick which will perform the nomination check
         let now = wait_advance(&mut state.local.checklist_set, now);
         let mut response =
@@ -7778,7 +7953,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -7789,6 +7964,9 @@ mod tests {
             state.local.checklist_set.poll(now),
             CheckListSetPollRet::Completed
         ));
+
+        let now = wait_advance(&mut state.local.checklist_set, now);
+        set_handle_channel_bind(&mut state.local.checklist_set, &mut turn_server, now);
 
         state.local.checklist_set.close(now);
 
@@ -8058,6 +8236,14 @@ mod tests {
         let check_id = nominate_check.conncheck_id;
         assert!(state.local_list().is_triggered(&pair));
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         // perform one tick which will perform the nomination check
         let now = wait_advance(&mut state.local.checklist_set, now);
         let mut response =
@@ -8080,7 +8266,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -8169,6 +8355,29 @@ mod tests {
                 unreachable!()
             }
         }
+    }
+
+    fn set_handle_channel_bind(
+        set: &mut ConnCheckListSet,
+        turn_server: &mut TurnServer,
+        now: Instant,
+    ) {
+        let Some(transmit) = set.poll_transmit(now) else {
+            unreachable!();
+        };
+        let checklist_id = transmit.checklist_id;
+        let channel_bind = Message::from_bytes(&transmit.transmit.data).unwrap();
+        assert!(channel_bind.has_class(MessageClass::Request));
+        assert!(channel_bind.has_method(CHANNEL_BIND));
+        let transmit = turn_server.recv(transmit.transmit, now).unwrap().build();
+        let transmit = Transmit::new(
+            Data::from(transmit.data.as_slice()),
+            transmit.transport,
+            transmit.from,
+            transmit.to,
+        );
+        let reply = set.incoming_data(checklist_id, 1, transmit, now, &mut None);
+        assert!(reply.handled);
     }
 
     #[test]
@@ -8284,6 +8493,14 @@ mod tests {
         let check_id = nominate_check.conncheck_id;
         assert!(state.local_list().is_triggered(&pair));
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         // perform one tick which will perform the nomination check
         let now = wait_advance(&mut state.local.checklist_set, now);
         let mut response =
@@ -8307,7 +8524,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -8319,13 +8536,13 @@ mod tests {
             CheckListSetPollRet::Completed
         ));
 
+        let now = wait_advance(&mut state.local.checklist_set, now);
+        set_handle_channel_bind(&mut state.local.checklist_set, &mut turn_server, now);
+
         state.local.checklist_set.close(now);
 
         // no RemoveSocket until the TURN DELETE is handled
-        let CheckListSetPollRet::WaitUntil(now) = state.local.checklist_set.poll(now) else {
-            unreachable!();
-        };
-
+        let now = wait_advance(&mut state.local.checklist_set, now);
         let Some(transmit) = state.local.checklist_set.poll_transmit(now) else {
             unreachable!();
         };
@@ -8441,6 +8658,14 @@ mod tests {
             for (mut response, transmit) in pending_checks {
                 response.response(&mut state.local.checklist_set, transmit, now);
             }
+
+            let CheckListSetPollRet::Event {
+                checklist_id: _,
+                event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            } = state.local.checklist_set.poll(now)
+            else {
+                unreachable!();
+            };
 
             state.check_nomination(&pair1, now);
 
@@ -8659,6 +8884,14 @@ mod tests {
 
         state.local_list().dump_check_state();
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
 
         let mut local_auth = ShortTermAuth::new();
@@ -8821,6 +9054,14 @@ mod tests {
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
 
         // The controlling peer nominates: its Binding request with USE-CANDIDATE produces
@@ -8902,7 +9143,7 @@ mod tests {
         );
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -9006,7 +9247,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -9078,7 +9319,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -9290,7 +9531,7 @@ mod tests {
         };
         let CheckListSetPollRet::Event {
             checklist_id: _,
-            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Completed),
         } = state.local.checklist_set.poll(now)
         else {
             unreachable!();
@@ -9352,6 +9593,14 @@ mod tests {
             .perform(&mut state.local.checklist_set, now);
         let c = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(c.state(), CandidatePairState::Succeeded);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
 
@@ -9417,6 +9666,14 @@ mod tests {
             .perform(&mut state.local.checklist_set, now);
         let c = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(c.state(), CandidatePairState::Succeeded);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
 
@@ -9798,6 +10055,14 @@ mod tests {
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
 
         state.check_nomination(&pair, now);
@@ -9862,6 +10127,14 @@ mod tests {
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
 
         state.check_nomination(&pair, now);
@@ -9915,6 +10188,14 @@ mod tests {
             .perform(&mut state.local.checklist_set, now);
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
 
@@ -9992,6 +10273,14 @@ mod tests {
             .perform(&mut state.local.checklist_set, now);
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
 
@@ -10063,6 +10352,14 @@ mod tests {
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
 
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
+
         let now = wait_advance(&mut state.local.checklist_set, now);
 
         state.check_nomination(&pair, now);
@@ -10141,6 +10438,14 @@ mod tests {
             .perform(&mut state.local.checklist_set, now);
         let check = state.local_list().check_by_id(check_id).unwrap();
         assert_eq!(check.state(), CandidatePairState::Succeeded);
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         let now = wait_advance(&mut state.local.checklist_set, now);
 
@@ -10251,6 +10556,14 @@ mod tests {
         for (mut response, transmit) in pending_checks {
             response.response(&mut state.local.checklist_set, transmit, now);
         }
+
+        let CheckListSetPollRet::Event {
+            checklist_id: _,
+            event: ConnCheckEvent::ComponentState(_cid, ComponentConnectionState::Connected),
+        } = state.local.checklist_set.poll(now)
+        else {
+            unreachable!();
+        };
 
         state.check_nomination(&pair1, now);
 
