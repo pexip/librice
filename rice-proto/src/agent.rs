@@ -124,6 +124,7 @@ pub struct AgentBuilder {
     ice_lite: bool,
     consent_freshness: bool,
     consent_freshness_config: consent::Config,
+    max_connectivity_checks: usize,
 }
 
 impl Default for AgentBuilder {
@@ -136,6 +137,7 @@ impl Default for AgentBuilder {
             ice_lite: false,
             consent_freshness: true,
             consent_freshness_config: consent::Config::default(),
+            max_connectivity_checks: crate::conncheck::DEFAULT_MAX_CHECK_LIST_SIZE,
         }
     }
 }
@@ -151,6 +153,21 @@ impl AgentBuilder {
     /// controlling value may change.
     pub fn controlling(mut self, controlling: bool) -> Self {
         self.controlling = controlling;
+        self
+    }
+
+    /// The maximum number of candidate pairs (connectivity checks) for each stream.
+    ///
+    /// When the limit is exceeded, the pairs beyond the limit (in priority order) that have not
+    /// started their connectivity checks (in the Frozen state) are removed.  The highest
+    /// priority pairs within the limit and the pairs that are taking part in the connectivity
+    /// checks are never removed, so the limit may be exceeded.  The limit also bounds the number
+    /// of remote candidates learnt from incoming connectivity checks (peer-reflexive candidates).
+    ///
+    /// A value of 0 means unlimited.  The default value is 100 as recommended by RFC 8445
+    /// Section 6.1.2.5.
+    pub fn max_connectivity_checks(mut self, max_connectivity_checks: usize) -> Self {
+        self.max_connectivity_checks = max_connectivity_checks;
         self
     }
 
@@ -238,6 +255,7 @@ impl AgentBuilder {
             .trickle_ice(self.trickle_ice)
             .timing_advance(self.timing_advance)
             .ice_lite(self.ice_lite)
+            .max_check_list_size(self.max_connectivity_checks)
             .build();
         if let Some(rto) = self.rto.clone() {
             checklistset.set_request_retransmits(rto);
@@ -304,6 +322,23 @@ impl Agent {
     ///  - Connectivity checks are never initiated from the ICE-lite peer.
     pub fn ice_lite(&self) -> bool {
         self.checklistset.ice_lite()
+    }
+
+    /// The maximum number of candidate pairs (connectivity checks) for each stream.
+    ///
+    /// A value of 0 means unlimited.  See [`AgentBuilder::max_connectivity_checks`] for details.
+    pub fn max_connectivity_checks(&self) -> usize {
+        self.checklistset.max_check_list_size()
+    }
+
+    /// Set the maximum number of candidate pairs (connectivity checks) for each stream.
+    ///
+    /// A value of 0 means unlimited.  Streams above the new limit are pruned immediately.  Pairs
+    /// that have already been removed are not restored by raising the limit.  See
+    /// [`AgentBuilder::max_connectivity_checks`] for details.
+    pub fn set_max_connectivity_checks(&mut self, max_connectivity_checks: usize) {
+        self.checklistset
+            .set_max_check_list_size(max_connectivity_checks);
     }
 
     /// Configure the default timeouts and retransmissions for each STUN request.
@@ -970,6 +1005,20 @@ mod tests {
         assert_eq!(agent.timing_advance(), ta);
         let agent = Agent::builder().timing_advance(ta).build();
         assert_eq!(agent.timing_advance(), ta);
+    }
+
+    #[test]
+    fn max_connectivity_checks() {
+        let _log = crate::tests::test_init_log();
+        let mut agent = Agent::default();
+        assert_eq!(
+            agent.max_connectivity_checks(),
+            crate::conncheck::DEFAULT_MAX_CHECK_LIST_SIZE
+        );
+        agent.set_max_connectivity_checks(10);
+        assert_eq!(agent.max_connectivity_checks(), 10);
+        let agent = Agent::builder().max_connectivity_checks(0).build();
+        assert_eq!(agent.max_connectivity_checks(), 0);
     }
 
     #[test]

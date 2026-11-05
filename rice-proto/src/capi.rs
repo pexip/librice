@@ -384,6 +384,50 @@ pub unsafe extern "C" fn rice_agent_set_ice_lite(agent: *const RiceAgent, ice_li
     }
 }
 
+/// Retrieve the maximum number of candidate pairs (connectivity checks) for each stream in the
+/// `RiceAgent`.
+///
+/// A value of 0 means unlimited.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_agent_get_max_connectivity_checks(agent: *const RiceAgent) -> usize {
+    unsafe {
+        let agent = Arc::from_raw(agent);
+        let proto_agent = agent.proto_agent.lock().unwrap();
+        let ret = proto_agent.max_connectivity_checks();
+
+        drop(proto_agent);
+        core::mem::forget(agent);
+        ret
+    }
+}
+
+/// Set the maximum number of candidate pairs (connectivity checks) for each stream in the
+/// `RiceAgent`.
+///
+/// When the limit is exceeded, the pairs beyond the limit (in priority order) that have not
+/// started their connectivity checks (in the Frozen state) are removed.  The highest priority
+/// pairs within the limit and the pairs that are taking part in the connectivity checks are never
+/// removed, so the limit may be exceeded.  The limit also bounds the number of remote candidates
+/// learnt from incoming connectivity checks (peer-reflexive candidates).
+///
+/// A value of 0 means unlimited.  The default value is 100 as recommended by RFC 8445
+/// Section 6.1.2.5.  Streams above the new limit are pruned immediately.  Pairs that have already
+/// been removed are not restored by raising the limit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_agent_set_max_connectivity_checks(
+    agent: *const RiceAgent,
+    max: usize,
+) {
+    unsafe {
+        let agent = Arc::from_raw(agent);
+        let mut proto_agent = agent.proto_agent.lock().unwrap();
+        proto_agent.set_max_connectivity_checks(max);
+
+        drop(proto_agent);
+        core::mem::forget(agent);
+    }
+}
+
 /// Retrieve the consent freshness configuration.
 ///
 /// If consent freshness is not enabled, both are set to 0.
@@ -3810,6 +3854,22 @@ mod tests {
         unsafe {
             let agent = rice_agent_new(true, false);
             assert!(rice_agent_get_controlling(agent));
+            rice_agent_unref(agent);
+        }
+    }
+
+    #[test]
+    fn rice_agent_max_connectivity_checks() {
+        unsafe {
+            let agent = rice_agent_new(true, false);
+            assert_eq!(
+                rice_agent_get_max_connectivity_checks(agent),
+                crate::conncheck::DEFAULT_MAX_CHECK_LIST_SIZE
+            );
+            rice_agent_set_max_connectivity_checks(agent, 8);
+            assert_eq!(rice_agent_get_max_connectivity_checks(agent), 8);
+            rice_agent_set_max_connectivity_checks(agent, 0);
+            assert_eq!(rice_agent_get_max_connectivity_checks(agent), 0);
             rice_agent_unref(agent);
         }
     }

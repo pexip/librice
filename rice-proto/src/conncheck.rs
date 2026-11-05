@@ -559,6 +559,16 @@ pub struct ConnCheckList {
     pending_recv: VecDeque<PendingRecv>,
     pending_turn_tcp_connect: Vec<PendingTurnTcp>,
     pending_turn_bind_channel: VecDeque<PendingTurnBindChannel>,
+    /// Upper limit on the number of pairs in `pairs`.  0 means unlimited.
+    max_check_list_size: usize,
+    /// Checks removed by the size limit whose resources still need to be released by the
+    /// `ConnCheckListSet`.
+    pruned_checks: Vec<ConnCheck>,
+    /// Pairs removed by the size limit.  Considered when generating checks so that the pruned
+    /// pairs are not regenerated (and immediately pruned again) for every new candidate.
+    pruned_pairs: Vec<CandidatePair>,
+    /// Whether a new peer-reflexive remote candidate has been ignored because of the size limit.
+    prflx_limit_warned: bool,
 }
 
 #[derive(Debug)]
@@ -680,7 +690,13 @@ fn generate_random_credentials() -> Credentials {
 }
 
 impl ConnCheckList {
-    fn new(checklist_id: usize, controlling: bool, trickle_ice: bool, ice_lite: bool) -> Self {
+    fn new(
+        checklist_id: usize,
+        controlling: bool,
+        trickle_ice: bool,
+        ice_lite: bool,
+        max_check_list_size: usize,
+    ) -> Self {
         let local_credentials = generate_random_credentials();
         let mut stun_auth_local = ShortTermAuth::new();
         stun_auth_local.set_credentials(local_credentials.clone().into(), IntegrityAlgorithm::Sha1);
@@ -715,6 +731,10 @@ impl ConnCheckList {
             pending_recv: VecDeque::new(),
             pending_turn_tcp_connect: Vec::new(),
             pending_turn_bind_channel: VecDeque::new(),
+            max_check_list_size,
+            pruned_checks: Vec::new(),
+            pruned_pairs: Vec::new(),
+            prflx_limit_warned: false,
         }
     }
 
@@ -1169,6 +1189,8 @@ impl ConnCheckList {
                 // FIXME: this may remove in flight checks
                 self.pairs
                     .retain(|pair| pair.pair.local != removed.candidate);
+                self.pruned_pairs
+                    .retain(|pair| pair.local != removed.candidate);
                 // TODO: signal potential socket/agent removal?
             }
         }
@@ -1550,7 +1572,9 @@ impl ConnCheckList {
                             )
                         });
 
-                    if let Some(redundant_pair) = pair.redundant_with(pairs.iter()) {
+                    if let Some(redundant_pair) =
+                        pair.redundant_with(pairs.iter().chain(self.pruned_pairs.iter()))
+                    {
                         if redundant_pair.remote.candidate_type == CandidateType::PeerReflexive {
                             match local.variant {
                                 LocalCandidateVariant::Agent(ref agent_id) => {
@@ -1655,6 +1679,79 @@ impl ConnCheckList {
             }
             self.add_check_if_not_duplicate(check);
         }
+        self.limit_size();
+    }
+
+    /// Enforce the maximum checklist size, keeping track of the removed checks and pairs.
+    fn limit_size(&mut self) {
+        let pruned = self.prune_to_max_size();
+        if pruned.is_empty() {
+            return;
+        }
+        self.pruned_pairs
+            .extend(pruned.iter().map(|check| check.pair.clone()));
+        self.pruned_checks.extend(pruned);
+    }
+
+    /// Enforce the upper limit on the number of candidate pairs (RFC 8445 Section 6.1.2.5) by
+    /// removing the lowest priority pairs.
+    ///
+    /// As in libnice, the highest priority `max_check_list_size` pairs are always kept and only
+    /// the pairs beyond the limit that are in the Frozen state are removed.  Pairs in any other
+    /// state take part in the connectivity checks and removing them may cause connectivity checks
+    /// to fail that would otherwise succeed.  The limit is therefore exceeded if any of the pairs
+    /// beyond the limit cannot be removed.
+    ///
+    /// Returns the removed checks.  Their resources must be released by the
+    /// [`ConnCheckListSet`].
+    fn prune_to_max_size(&mut self) -> Vec<ConnCheck> {
+        if self.max_check_list_size == 0 || self.pairs.len() <= self.max_check_list_size {
+            return Vec::new();
+        }
+        let mut removed = Vec::new();
+        // self.pairs is sorted by descending priority, so the pairs beyond the limit are the
+        // lowest priority pairs.  Walk from the tail so that removals do not move the pairs
+        // that are still to be visited.
+        for i in (self.max_check_list_size..self.pairs.len()).rev() {
+            let check = &self.pairs[i];
+            // A Frozen check can still be referenced by the valid list (and therefore be
+            // nominated) when a check of another pair produces it as the valid pair.  Removing
+            // it would silently drop it from nomination.
+            if check.state() == CandidatePairState::Frozen
+                && !self.check_is_referenced(check.conncheck_id)
+            {
+                removed.push(self.pairs.remove(i).unwrap());
+            }
+        }
+        if !removed.is_empty() {
+            debug!(
+                checklist_id = self.checklist_id,
+                "Pruned {} pairs, {} pairs remaining, maximum {}",
+                removed.len(),
+                self.pairs.len(),
+                self.max_check_list_size
+            );
+        }
+        removed
+    }
+
+    fn check_is_referenced(&self, conncheck_id: ConnCheckId) -> bool {
+        self.valid.contains(&conncheck_id)
+            || self
+                .nominated
+                .iter()
+                .any(|(nominated_id, _pair)| *nominated_id == conncheck_id)
+            || self.triggered.contains(&conncheck_id)
+    }
+
+    fn set_max_check_list_size(&mut self, max_check_list_size: usize) {
+        self.max_check_list_size = max_check_list_size;
+        self.limit_size();
+    }
+
+    /// Whether no more remote candidates should be learnt from incoming connectivity checks.
+    fn peer_reflexive_limit_reached(&self) -> bool {
+        self.max_check_list_size != 0 && self.remote_candidates.len() >= self.max_check_list_size
     }
 
     fn check_is_equal(check: &ConnCheck, pair: &CandidatePair, nominate: Nominate) -> bool {
@@ -2248,6 +2345,8 @@ impl ConnCheckList {
         self.nominated.clear();
         self.pending_turn_permissions.clear();
         self.agents.clear();
+        self.pruned_checks.clear();
+        self.pruned_pairs.clear();
     }
 
     pub fn restart(&mut self, config: &RestartStreamConfig) -> RestartRemoveChecks {
@@ -2284,6 +2383,11 @@ impl ConnCheckList {
         });
         self.valid.clear();
         self.previous_nominated_pairs = keep_pairs;
+        // pruned checks that have not been released yet are released with the other removed
+        // checks.
+        remove_pairs.append(&mut self.pruned_checks);
+        self.pruned_pairs.clear();
+        self.prflx_limit_warned = false;
         if config.local_remove_candidates {
             self.local_candidates.clear();
         }
@@ -2327,6 +2431,7 @@ pub struct ConnCheckListSetBuilder {
     timing_advance: Duration,
     rto: Option<RequestRto>,
     ice_lite: bool,
+    max_check_list_size: usize,
 }
 
 impl ConnCheckListSetBuilder {
@@ -2338,6 +2443,7 @@ impl ConnCheckListSetBuilder {
             timing_advance: DEFAULT_MINIMUM_SET_TICK,
             rto: None,
             ice_lite: false,
+            max_check_list_size: DEFAULT_MAX_CHECK_LIST_SIZE,
         }
     }
 
@@ -2367,6 +2473,14 @@ impl ConnCheckListSetBuilder {
         self
     }
 
+    /// The maximum number of candidate pairs in each [`ConnCheckList`].  0 means unlimited.
+    ///
+    /// The default value is [`DEFAULT_MAX_CHECK_LIST_SIZE`].
+    pub fn max_check_list_size(mut self, max_check_list_size: usize) -> Self {
+        self.max_check_list_size = max_check_list_size;
+        self
+    }
+
     /// Build the [`ConnCheckListSet`]
     pub fn build(self) -> ConnCheckListSet {
         ConnCheckListSet {
@@ -2384,6 +2498,7 @@ impl ConnCheckListSetBuilder {
             timing_advance: self.timing_advance,
             rto: self.rto,
             ice_lite: self.ice_lite,
+            max_check_list_size: self.max_check_list_size,
             consent_tids: Vec::new(),
             consent_responses: Vec::new(),
             local_consent_revoked: Vec::new(),
@@ -2395,6 +2510,13 @@ impl ConnCheckListSetBuilder {
 pub const DEFAULT_MINIMUM_SET_TICK: Duration = Duration::from_millis(50);
 /// Minimum Ta as specified in RFC8445
 pub const MIN_TIMING_ADVANCE: Duration = Duration::from_millis(5);
+/// The default maximum number of candidate pairs in a [`ConnCheckList`].
+///
+/// RFC 8445 Section 6.1.2.5 recommends limiting the number of candidate pairs with a default
+/// limit of 100.  As in libnice, the limit is applied to each [`ConnCheckList`] (i.e. each
+/// stream) and the Frozen pairs beyond the limit (in priority order) are removed when the limit
+/// is exceeded.
+pub const DEFAULT_MAX_CHECK_LIST_SIZE: usize = 100;
 
 /// A set of [`ConnCheckList`]s within an ICE Agent.
 #[derive(Debug)]
@@ -2413,6 +2535,7 @@ pub struct ConnCheckListSet {
     timing_advance: Duration,
     rto: Option<RequestRto>,
     ice_lite: bool,
+    max_check_list_size: usize,
     /// Consent check TIDs: (tid, checklist_id, component_id).
     consent_tids: Vec<(TransactionId, usize, usize)>,
     /// Consent responses received since last poll: (checklist_id, component_id, consent_revoked).
@@ -2438,6 +2561,7 @@ impl ConnCheckListSet {
             self.controlling(),
             self.trickle_ice,
             self.ice_lite,
+            self.max_check_list_size,
         );
         self.checklists.push(ret);
         checklist_id
@@ -2522,9 +2646,36 @@ impl ConnCheckListSet {
             for c in self.checklists.iter_mut() {
                 c.pairs.clear();
                 c.triggered.clear();
+                c.pruned_pairs.clear();
                 c.ice_lite = ice_lite;
             }
             self.ice_lite = ice_lite;
+        }
+    }
+
+    /// The maximum number of candidate pairs in each [`ConnCheckList`].  0 means unlimited.
+    pub fn max_check_list_size(&self) -> usize {
+        self.max_check_list_size
+    }
+
+    /// Set the maximum number of candidate pairs in each [`ConnCheckList`].  0 means unlimited.
+    ///
+    /// Any [`ConnCheckList`] above the new limit is pruned immediately.  Pairs that have already
+    /// been removed are not restored by raising the limit.
+    pub fn set_max_check_list_size(&mut self, max_check_list_size: usize) {
+        self.max_check_list_size = max_check_list_size;
+        for c in self.checklists.iter_mut() {
+            c.set_max_check_list_size(max_check_list_size);
+        }
+    }
+
+    /// Release the resources of any checks removed by the checklist size limit.
+    fn release_pruned_checks(&mut self, now: Instant) {
+        for checklist_i in 0..self.checklists.len() {
+            let pruned = core::mem::take(&mut self.checklists[checklist_i].pruned_checks);
+            for check in pruned {
+                self.remove_check_resources(checklist_i, check, now);
+            }
         }
     }
 
@@ -3165,9 +3316,34 @@ impl ConnCheckListSet {
             trace!("checked for role conflicts");
         }
         let checklist = &mut self.checklists[checklist_i];
-        let remote = checklist
-            .find_remote_candidate(local.component_id, local.transport_type, from)
-            .unwrap_or_else(|| {
+        let existing_remote =
+            checklist.find_remote_candidate(local.component_id, local.transport_type, from);
+        let remote = match existing_remote {
+            Some(remote) => remote,
+            None if checklist.peer_reflexive_limit_reached() => {
+                // Respond as usual but do not grow the checklist any further.  No pair will ever
+                // use this address so it is also not added as a validated peer, which would
+                // otherwise keep state for every new source address.
+                if !checklist.prflx_limit_warned {
+                    checklist.prflx_limit_warned = true;
+                    warn!(
+                        checklist_id = checklist.checklist_id,
+                        "Not adding peer-reflexive remote candidate for {from}: the checklist \
+                         already has {} remote candidates (maximum {}).  Further peer-reflexive \
+                         remote candidates will be ignored",
+                        checklist.remote_candidates.len(),
+                        checklist.max_check_list_size,
+                    );
+                } else {
+                    debug!("Ignoring peer-reflexive remote candidate for {from}");
+                }
+                return Ok(binding_success_response(
+                    msg,
+                    from,
+                    &mut checklist.stun_auth_local,
+                ));
+            }
+            None => {
                 debug!("no existing remote candidate for {from}");
                 // If the source transport address of the request does not match any
                 // existing remote candidates, it represents a new peer-reflexive remote
@@ -3197,7 +3373,8 @@ impl ConnCheckListSet {
                 debug!("new reflexive remote {:?}", cand);
                 checklist.add_remote_candidate(cand.clone());
                 cand
-            });
+            }
+        };
         trace!("remote candidate {remote:?}");
         let pair = CandidatePair::new(local.clone(), remote);
         if self.ice_lite {
@@ -3916,6 +4093,8 @@ impl ConnCheckListSet {
     /// [`CheckListSetPollRet::WaitUntil`] is returned.
     #[tracing::instrument(name = "check_set_poll", level = "debug", ret, skip(self))]
     pub fn poll(&mut self, now: Instant) -> CheckListSetPollRet {
+        self.release_pruned_checks(now);
+
         // Drain pending consent freshness responses first.
         if let Some((checklist_id, cid, revoked)) = self.consent_responses.pop() {
             return CheckListSetPollRet::Event {
@@ -4747,6 +4926,7 @@ impl ConnCheckListSet {
     }
 
     pub fn close(&mut self, now: Instant) {
+        self.release_pruned_checks(now);
         for checklist_i in 0..self.checklists.len() {
             let checklist = &mut self.checklists[checklist_i];
             let checklist_id = checklist.checklist_id;
@@ -5661,6 +5841,374 @@ mod tests {
         let pair4 = CandidatePair::new(local1.candidate, remote1.candidate.clone());
         let pair5 = CandidatePair::new(local3.candidate, remote1.candidate);
         assert_list_contains_checks(list, vec![&pair1, &pair2, &pair3, &pair4, &pair5]);
+    }
+
+    /// Host candidates where every local and remote candidate pair has a distinct priority.
+    fn max_size_candidates(n_local: u16, n_remote: u16) -> (Vec<Candidate>, Vec<Candidate>) {
+        let candidate = |port: u16, priority: u32| {
+            Peer::builder()
+                .priority(priority)
+                .local_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+                .build()
+                .candidate
+        };
+        let local = (1..=n_local)
+            .map(|i| candidate(1000 + i, 1000 * u32::from(i)))
+            .collect();
+        let remote = (1..=n_remote)
+            .map(|i| candidate(2000 + i, 10 * u32::from(i)))
+            .collect();
+        (local, remote)
+    }
+
+    fn max_size_list(
+        set: &mut ConnCheckListSet,
+        local: &[Candidate],
+        remote: &[Candidate],
+    ) -> usize {
+        let list_id = set.new_list();
+        let list = set.mut_list(list_id).unwrap();
+        list.add_component(1);
+        for candidate in local {
+            assert!(list.add_local_candidate(candidate.clone()));
+        }
+        for candidate in remote {
+            list.add_remote_candidate(candidate.clone());
+        }
+        list_id
+    }
+
+    fn pair_ids(list: &ConnCheckList) -> Vec<ConnCheckId> {
+        list.pairs.iter().map(|check| check.conncheck_id).collect()
+    }
+
+    fn pruned_ids(list: &ConnCheckList) -> Vec<ConnCheckId> {
+        list.pruned_checks
+            .iter()
+            .map(|check| check.conncheck_id)
+            .collect()
+    }
+
+    fn assert_pairs_priority_descending(list: &ConnCheckList) {
+        let priorities = list
+            .pairs
+            .iter()
+            .map(|check| check.pair.priority(list.controlling))
+            .collect::<Vec<_>>();
+        assert!(
+            priorities.windows(2).all(|w| w[0] >= w[1]),
+            "{priorities:?}"
+        );
+    }
+
+    #[test]
+    fn checklist_max_size_keeps_highest_priority_pairs() {
+        let _log = crate::tests::test_init_log();
+        assert_eq!(
+            ConnCheckListSet::builder(0, true)
+                .build()
+                .max_check_list_size(),
+            DEFAULT_MAX_CHECK_LIST_SIZE
+        );
+        let (local, remote) = max_size_candidates(3, 4);
+
+        // 0 is unlimited
+        let mut unlimited_set = ConnCheckListSet::builder(0, true)
+            .max_check_list_size(0)
+            .build();
+        let unlimited_id = max_size_list(&mut unlimited_set, &local, &remote);
+        let unlimited = unlimited_set.mut_list(unlimited_id).unwrap();
+        assert_eq!(unlimited.pairs.len(), 12);
+        assert!(unlimited.pruned_checks.is_empty());
+        assert!(unlimited.pruned_pairs.is_empty());
+        assert_pairs_priority_descending(unlimited);
+        let expected = unlimited
+            .pairs
+            .iter()
+            .take(5)
+            .map(|check| check.pair.clone())
+            .collect::<Vec<_>>();
+
+        let mut set = ConnCheckListSet::builder(0, true)
+            .max_check_list_size(5)
+            .build();
+        assert_eq!(set.max_check_list_size(), 5);
+        let list_id = max_size_list(&mut set, &local, &remote);
+        let list = set.mut_list(list_id).unwrap();
+        assert_eq!(list.pairs.len(), 5);
+        assert_pairs_priority_descending(list);
+        assert_eq!(
+            list.pairs
+                .iter()
+                .map(|check| check.pair.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // each pair is only ever removed once
+        assert_eq!(list.pruned_checks.len(), 7);
+        assert_eq!(list.pruned_pairs.len(), 7);
+        assert!(
+            list.pruned_checks
+                .iter()
+                .all(|check| check.state() == CandidatePairState::Frozen)
+        );
+
+        // removed checks are released by the set
+        let _ = set.poll(Instant::ZERO);
+        assert!(set.mut_list(list_id).unwrap().pruned_checks.is_empty());
+    }
+
+    #[test]
+    fn checklist_max_size_only_removes_unreferenced_frozen_pairs() {
+        let _log = crate::tests::test_init_log();
+        let (local, remote) = max_size_candidates(1, 4);
+        #[allow(clippy::type_complexity)]
+        let protections: &[(&str, fn(&mut ConnCheckList, ConnCheckId))] = &[
+            ("waiting", |list, id| {
+                list.mut_check_by_id(id)
+                    .unwrap()
+                    .set_state(CandidatePairState::Waiting)
+            }),
+            ("in-progress", |list, id| {
+                list.mut_check_by_id(id)
+                    .unwrap()
+                    .set_state(CandidatePairState::InProgress)
+            }),
+            ("succeeded", |list, id| {
+                list.mut_check_by_id(id)
+                    .unwrap()
+                    .set_state(CandidatePairState::Succeeded)
+            }),
+            // failed pairs are removed by maybe_remove_sockets()
+            ("failed", |list, id| {
+                list.mut_check_by_id(id)
+                    .unwrap()
+                    .set_state(CandidatePairState::Failed)
+            }),
+            ("frozen-valid", |list, id| list.valid.push(id)),
+            ("frozen-nominated", |list, id| {
+                let pair = list.check_by_id(id).unwrap().pair.clone();
+                list.nominated.push((id, pair));
+            }),
+            ("frozen-triggered", |list, id| list.triggered.push_back(id)),
+        ];
+
+        for (name, protect) in protections {
+            info!("protecting the lowest priority pair: {name}");
+            let mut set = ConnCheckListSet::builder(0, true)
+                .max_check_list_size(0)
+                .build();
+            let list_id = max_size_list(&mut set, &local, &remote);
+            let list = set.mut_list(list_id).unwrap();
+            let ids = pair_ids(list);
+            assert_eq!(ids.len(), 4);
+            protect(list, ids[3]);
+
+            list.set_max_check_list_size(2);
+            // Only the unreferenced Frozen pair beyond the limit is removed.  The lowest priority
+            // pair is kept and, as in libnice, the highest priority pairs within the limit are
+            // never removed to make up for it, so the limit is still exceeded.
+            assert_eq!(pair_ids(list), vec![ids[0], ids[1], ids[3]]);
+            assert_eq!(pruned_ids(list), vec![ids[2]]);
+            assert_pairs_priority_descending(list);
+        }
+    }
+
+    #[test]
+    fn checklist_max_size_exceeded_without_frozen_pairs() {
+        let _log = crate::tests::test_init_log();
+        let (local, remote) = max_size_candidates(2, 3);
+        let mut set = ConnCheckListSet::builder(0, true)
+            .max_check_list_size(0)
+            .build();
+        let list_id = max_size_list(&mut set, &local, &remote[1..]);
+        let list = set.mut_list(list_id).unwrap();
+        for check in list.pairs.iter_mut() {
+            check.set_state(CandidatePairState::Waiting);
+        }
+        let ids = pair_ids(list);
+        assert_eq!(ids.len(), 4);
+
+        // nothing can be removed
+        list.set_max_check_list_size(1);
+        assert_eq!(pair_ids(list), ids);
+        assert!(list.pruned_checks.is_empty());
+        assert!(list.pruned_pairs.is_empty());
+
+        // new Frozen pairs are removed while the limit is exceeded
+        list.add_remote_candidate(remote[0].clone());
+        assert_eq!(pair_ids(list), ids);
+        assert_eq!(list.pruned_checks.len(), 2);
+        assert!(
+            list.pruned_checks
+                .iter()
+                .all(|check| check.pair.remote == remote[0])
+        );
+    }
+
+    #[test]
+    fn checklist_max_size_does_not_regenerate_removed_pairs() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let (local, remote) = max_size_candidates(2, 4);
+        let mut set = ConnCheckListSet::builder(0, true)
+            .max_check_list_size(2)
+            .build();
+        // highest priority remote candidate first
+        let list_id = max_size_list(&mut set, &local, &remote[3..]);
+        let list = set.mut_list(list_id).unwrap();
+        let kept = pair_ids(list);
+        assert_eq!(kept.len(), 2);
+
+        for (i, candidate) in remote[..3].iter().rev().enumerate() {
+            list.add_remote_candidate(candidate.clone());
+            // only the new lower priority pairs are removed.  Previously removed pairs are not
+            // generated (and removed) again.
+            assert_eq!(pair_ids(list), kept);
+            assert_eq!(list.pruned_checks.len(), 2 * (i + 1));
+            assert_eq!(list.pruned_pairs.len(), 2 * (i + 1));
+        }
+        let _ = set.poll(now);
+        let list = set.mut_list(list_id).unwrap();
+        assert!(list.pruned_checks.is_empty());
+        assert_eq!(list.pruned_pairs.len(), 6);
+
+        // lowering the limit removes pairs immediately
+        set.set_max_check_list_size(1);
+        assert_eq!(set.max_check_list_size(), 1);
+        let list = set.mut_list(list_id).unwrap();
+        assert_eq!(pair_ids(list), vec![kept[0]]);
+        assert_eq!(pruned_ids(list), vec![kept[1]]);
+
+        // a restart releases the removed checks and allows all pairs to be generated again
+        let remove = list.restart(&RestartStreamConfig::new());
+        assert_eq!(remove.checks.len(), 2);
+        assert!(list.pruned_checks.is_empty());
+        assert!(list.pruned_pairs.is_empty());
+        set.remove_checks(list_id, remove, now);
+        set.set_max_check_list_size(0);
+        let list = set.mut_list(list_id).unwrap();
+        for candidate in remote.iter() {
+            list.add_remote_candidate(candidate.clone());
+        }
+        assert_eq!(list.pairs.len(), 8);
+        assert_pairs_priority_descending(list);
+    }
+
+    #[test]
+    fn checklist_max_size_releases_removed_check_resources() {
+        let _log = crate::tests::test_init_log();
+        let now = Instant::ZERO;
+        let mut set = ConnCheckListSet::builder(0, true)
+            .max_check_list_size(0)
+            .build();
+        let list_id = set.new_list();
+        let list = set.mut_list(list_id).unwrap();
+        list.add_component(1);
+
+        // UDP pairs: both use the STUN agent of the local candidate
+        let udp_local = Peer::builder()
+            .priority(4000)
+            .local_addr("127.0.0.1:1000".parse().unwrap())
+            .build();
+        let udp_remote_high = Peer::builder()
+            .priority(400)
+            .local_addr("127.0.0.1:2000".parse().unwrap())
+            .build();
+        let udp_remote_low = Peer::builder()
+            .priority(40)
+            .local_addr("127.0.0.1:2001".parse().unwrap())
+            .build();
+        assert!(list.add_local_candidate(udp_local.candidate.clone()));
+        list.add_remote_candidate(udp_remote_high.candidate.clone());
+        list.add_remote_candidate(udp_remote_low.candidate.clone());
+        let udp_agent_id = list.pairs[0].agent_id().unwrap();
+
+        // TCP pair without a connection yet
+        let tcp_active_local = Peer::builder()
+            .priority(3000)
+            .transport(TransportType::Tcp)
+            .tcp_type(TcpType::Active)
+            .local_addr("127.0.0.1:9".parse().unwrap())
+            .build();
+        let tcp_passive_remote = Peer::builder()
+            .priority(30)
+            .transport(TransportType::Tcp)
+            .tcp_type(TcpType::Passive)
+            .local_addr("127.0.0.1:3000".parse().unwrap())
+            .build();
+        assert!(list.add_local_candidate(tcp_active_local.candidate.clone()));
+        list.add_remote_candidate(tcp_passive_remote.candidate.clone());
+
+        // Frozen TCP pair with an established connection, e.g. a check that has been restarted
+        // after the remote credentials changed.
+        let tcp_local_addr = "127.0.0.1:4000".parse().unwrap();
+        let tcp_remote_addr = "127.0.0.1:5000".parse().unwrap();
+        let tcp_passive_local = Peer::builder()
+            .priority(2000)
+            .transport(TransportType::Tcp)
+            .tcp_type(TcpType::Passive)
+            .local_addr(tcp_local_addr)
+            .build();
+        let tcp_active_remote = Peer::builder()
+            .priority(20)
+            .transport(TransportType::Tcp)
+            .tcp_type(TcpType::Active)
+            .local_addr(tcp_remote_addr)
+            .build();
+        let (tcp_agent_id, _) =
+            list.add_agent_for_5tuple(TransportType::Tcp, tcp_local_addr, tcp_remote_addr, None);
+        let tcp_check = ConnCheck::new(
+            list.checklist_id,
+            CandidatePair::new(
+                tcp_passive_local.candidate.clone(),
+                tcp_active_remote.candidate.clone(),
+            ),
+            tcp_agent_id,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(tcp_check.state(), CandidatePairState::Frozen);
+        list.add_check(tcp_check);
+
+        assert_eq!(list.pairs.len(), 4);
+        let kept = list.pairs[0].conncheck_id;
+        assert_eq!(list.pairs[0].pair.remote, udp_remote_high.candidate);
+
+        set.set_max_check_list_size(1);
+        let list = set.mut_list(list_id).unwrap();
+        assert_eq!(pair_ids(list), vec![kept]);
+        assert_eq!(list.pruned_checks.len(), 3);
+
+        let mut removed_sockets = Vec::new();
+        for _ in 0..8 {
+            match set.poll(now) {
+                CheckListSetPollRet::RemoveSocket {
+                    checklist_id,
+                    component_id,
+                    transport,
+                    local_addr,
+                    remote_addr,
+                } => {
+                    assert_eq!(checklist_id, list_id);
+                    assert_eq!(component_id, 1);
+                    removed_sockets.push((transport, local_addr, remote_addr));
+                }
+                CheckListSetPollRet::WaitUntil(_) => break,
+                _ => (),
+            }
+        }
+        // only the TCP connection owned by the removed check is closed
+        assert_eq!(
+            removed_sockets,
+            vec![(TransportType::Tcp, tcp_local_addr, tcp_remote_addr)]
+        );
+        let list = set.mut_list(list_id).unwrap();
+        assert!(list.pruned_checks.is_empty());
+        assert!(list.agent_by_id(tcp_agent_id).is_none());
+        assert!(list.agent_by_id(udp_agent_id).is_some());
+        assert_eq!(pair_ids(list), vec![kept]);
     }
 
     #[test]
@@ -6796,6 +7344,126 @@ mod tests {
         remote_agent
             .send_request(request.finish(), to, now)
             .unwrap()
+    }
+
+    /// Send a connectivity check from `from` and check that it is answered successfully.
+    fn prflx_request_from(state: &mut FineControl, from: SocketAddr, now: Instant) {
+        let prflx_peer = Peer::builder()
+            .local_addr(from)
+            .foundation("1")
+            .local_credentials(state.remote.local_credentials.clone().unwrap())
+            .remote_credentials(state.local.peer.local_credentials.clone().unwrap())
+            .build();
+        let (mut remote_agent, _remote_auth, mut local_auth) = prflx_peer.stun_agent();
+        let local_addr = state.local.peer.candidate.base_address;
+        let transmit = remote_generate_check(
+            &prflx_peer,
+            &mut remote_agent,
+            local_addr,
+            false,
+            false,
+            now,
+        );
+        let reply = state.local.checklist_set.incoming_data(
+            state.local.checklist_id,
+            1,
+            transmit,
+            now,
+            &mut None,
+        );
+        assert!(reply.handled);
+
+        let Some(transmit) = state.local.checklist_set.poll_transmit(now) else {
+            unreachable!();
+        };
+        assert_eq!(transmit.transmit.from, local_addr);
+        assert_eq!(transmit.transmit.to, from);
+        let response = Message::from_bytes(&transmit.transmit.data).unwrap();
+        assert!(response.has_class(MessageClass::Success));
+        assert!(matches!(
+            local_auth.validate_incoming_message(&response).unwrap(),
+            Some(IntegrityAlgorithm::Sha1)
+        ));
+    }
+
+    #[test]
+    fn conncheck_incoming_prflx_max_size() {
+        let _log = crate::tests::test_init_log();
+        let mut state = FineControl::builder().build();
+        let now = Instant::ZERO;
+        state.local.checklist_set.set_max_check_list_size(4);
+        assert_eq!(state.local_list().remote_candidates().len(), 1);
+
+        for i in 0..8 {
+            let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000 + i);
+            prflx_request_from(&mut state, from, now);
+            // peer-reflexive remote candidates are only added below the limit
+            let list = state.local_list();
+            assert_eq!(list.remote_candidates().len(), (2 + usize::from(i)).min(4));
+            assert_eq!(list.prflx_limit_warned, i >= 3);
+            assert!(list.pairs.len() <= 4);
+        }
+
+        // 0 is unlimited
+        state.local.checklist_set.set_max_check_list_size(0);
+        let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        prflx_request_from(&mut state, from, now);
+        assert_eq!(state.local_list().remote_candidates().len(), 5);
+    }
+
+    #[test]
+    fn conncheck_incoming_check_restores_removed_pair() {
+        let _log = crate::tests::test_init_log();
+        let mut state = FineControl::builder().build();
+        let now = Instant::ZERO;
+        state.local.checklist_set.set_max_check_list_size(1);
+        let initial_id = pair_ids(state.local_list())[0];
+
+        // the pair of a lower priority remote candidate is removed by the size limit
+        let removed_remote = Peer::builder()
+            .priority(10)
+            .local_addr("127.0.0.1:3".parse().unwrap())
+            .build()
+            .candidate;
+        state
+            .local_list()
+            .add_remote_candidate(removed_remote.clone());
+        let pair = CandidatePair::new(state.local.peer.candidate.clone(), removed_remote.clone());
+        let list = state.local_list();
+        assert_eq!(pair_ids(list), vec![initial_id]);
+        assert!(list.matching_check(&pair, Nominate::DontCare).is_none());
+        assert!(list.pruned_pairs.contains(&pair));
+
+        // A connectivity check from the peer for the removed pair adds it back as a triggered
+        // check (RFC 8445 Section 7.3.1.4), even though the limit is exceeded.
+        prflx_request_from(&mut state, removed_remote.address, now);
+        let list = state.local_list();
+        assert_eq!(list.remote_candidates().len(), 2);
+        assert!(!list.prflx_limit_warned);
+        let restored = list.matching_check(&pair, Nominate::False).unwrap();
+        assert_eq!(restored.state(), CandidatePairState::Waiting);
+        let restored_id = restored.conncheck_id;
+        assert!(list.is_triggered(&pair));
+        assert_eq!(pair_ids(list), vec![initial_id, restored_id]);
+
+        // Neither the highest priority pair nor the restored pair are removed for a new lower
+        // priority pair.
+        let new_remote = Peer::builder()
+            .priority(5)
+            .local_addr("127.0.0.1:4".parse().unwrap())
+            .build()
+            .candidate;
+        state.local_list().add_remote_candidate(new_remote.clone());
+        let list = state.local_list();
+        assert_eq!(pair_ids(list), vec![initial_id, restored_id]);
+        assert_eq!(list.pruned_checks.len(), 2);
+        assert_eq!(list.pruned_checks[1].pair.remote, new_remote);
+        assert_pairs_priority_descending(list);
+
+        let _ = state.local.checklist_set.poll(now);
+        let list = state.local_list();
+        assert!(list.pruned_checks.is_empty());
+        assert_eq!(pair_ids(list), vec![initial_id, restored_id]);
     }
 
     #[test]
