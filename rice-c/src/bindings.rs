@@ -684,6 +684,14 @@ unsafe extern "C" {
     pub fn rice_agent_set_ice_lite(agent: *const RiceAgent, ice_lite: bool);
 }
 unsafe extern "C" {
+    #[doc = " Retrieve the maximum number of candidate pairs (connectivity checks) for each stream in the\n `RiceAgent`.\n\n A value of 0 means unlimited."]
+    pub fn rice_agent_get_max_connectivity_checks(agent: *const RiceAgent) -> usize;
+}
+unsafe extern "C" {
+    #[doc = " Set the maximum number of candidate pairs (connectivity checks) for each stream in the\n `RiceAgent`.\n\n When the limit is exceeded, the pairs beyond the limit (in priority order) that have not\n started their connectivity checks (in the Frozen state) are removed.  The highest priority\n pairs within the limit and the pairs that are taking part in the connectivity checks are never\n removed, so the limit may be exceeded.  The limit also bounds the number of remote candidates\n learnt from incoming connectivity checks (peer-reflexive candidates).\n\n A value of 0 means unlimited.  The default value is 100 as recommended by RFC 8445\n Section 6.1.2.5.  Streams above the new limit are pruned immediately.  Pairs that have already\n been removed are not restored by raising the limit."]
+    pub fn rice_agent_set_max_connectivity_checks(agent: *const RiceAgent, max: usize);
+}
+unsafe extern "C" {
     #[doc = " Retrieve the consent freshness configuration.\n\n If consent freshness is not enabled, both are set to 0."]
     pub fn rice_agent_get_consent_freshness_config(
         agent: *const RiceAgent,
