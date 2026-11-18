@@ -2888,7 +2888,7 @@ impl ConnCheckListSet {
         &mut self,
         checklist_id: usize,
         component_id: usize,
-        mut transmit: Transmit<T>,
+        transmit: Transmit<T>,
         now: Instant,
         ignorable: &mut Option<RecvIgnorable>,
     ) -> HandleRecvReply<T> {
@@ -2902,7 +2902,6 @@ impl ConnCheckListSet {
         };
 
         // first de-TURN any incoming data
-        let mut turn_client_id = None;
         if let Some((turn_id, turn_server_addr, checklist_i2)) = self.checklists[checklist_i]
             .find_turn_client_for_5tuple(transmit.transport, transmit.to, transmit.from)
             .map(|(id, client)| (id, client.remote_addr(), checklist_i))
@@ -2917,21 +2916,26 @@ impl ConnCheckListSet {
             let client = self.checklists[checklist_i]
                 .mut_turn_client_by_id(turn_id)
                 .unwrap();
+            let turn_client_transport = client.client.transport();
+            let turn_client_id = Some((turn_id, turn_server_addr));
+            let mut reply = HandleRecvReply::default();
             match client.client.recv(transmit, now) {
                 TurnRecvRet::Handled => {
                     // TODO: maybe handle turn events here?
                     trace!("TURN client handled the incoming data");
-                    return HandleRecvReply {
-                        handled: true,
-                        ..Default::default()
-                    };
+                    reply.handled = true;
                 }
                 TurnRecvRet::Ignored(ignored) => {
-                    transmit = ignored;
+                    return self.incoming_data_or_stun(
+                        checklist_i,
+                        component_id,
+                        ignored,
+                        None,
+                        now,
+                        ignorable,
+                    );
                 }
                 TurnRecvRet::PeerData(peer) => {
-                    let turn_client_transport = client.client.transport();
-                    turn_client_id = Some((turn_id, turn_server_addr));
                     checklist_i = checklist_i2;
                     // FIXME: dual allocation TURN
                     let transmit = Transmit::new(
@@ -2940,57 +2944,15 @@ impl ConnCheckListSet {
                         peer.peer,
                         client.client.relayed_addresses().next().unwrap().1,
                     );
-                    let ret = self.incoming_data_or_stun(
+                    self.incoming_turn_peer_data(
                         checklist_i,
                         component_id,
                         transmit,
                         turn_client_id,
                         now,
                         ignorable,
+                        &mut reply,
                     );
-                    if let Some(data) = ret.data.as_ref() {
-                        let checklist = &mut self.checklists[checklist_i];
-                        checklist.pending_recv.push_back(PendingRecv {
-                            component_id,
-                            data: data.as_ref().to_vec(),
-                        });
-                    }
-                    if turn_client_transport != TransportType::Udp {
-                        loop {
-                            let client = self.checklists[checklist_i]
-                                .mut_turn_client_by_id(turn_id)
-                                .unwrap();
-                            let Some(peer) = client.client.poll_recv(now) else {
-                                break;
-                            };
-                            let transmit = Transmit::new(
-                                peer.data(),
-                                peer.transport,
-                                peer.peer,
-                                client.client.relayed_addresses().next().unwrap().1,
-                            );
-                            let ret = self.incoming_data_or_stun(
-                                checklist_i,
-                                component_id,
-                                transmit,
-                                turn_client_id,
-                                now,
-                                ignorable,
-                            );
-                            if let Some(data) = ret.data.as_ref() {
-                                let checklist = &mut self.checklists[checklist_i];
-                                checklist.pending_recv.push_back(PendingRecv {
-                                    component_id,
-                                    data: data.as_ref().to_vec(),
-                                });
-                            }
-                        }
-                    }
-                    return HandleRecvReply {
-                        handled: ret.handled,
-                        have_more_data: true,
-                        ..Default::default()
-                    };
                 }
                 TurnRecvRet::PeerIcmp {
                     transport,
@@ -3002,22 +2964,86 @@ impl ConnCheckListSet {
                     debug!(
                         "conncheck received ICMP(type:{icmp_type:x}, code:{icmp_code:x}) over TURN from {transport}:{peer}"
                     );
-                    return HandleRecvReply {
-                        handled: true,
-                        ..Default::default()
-                    };
+                    reply.handled = true;
                 }
             }
+            // A stream based TURN client may have buffered further messages (TURN control and/or
+            // peer data) from the same input that must all be processed now.
+            if turn_client_transport != TransportType::Udp {
+                loop {
+                    let client = self.checklists[checklist_i]
+                        .mut_turn_client_by_id(turn_id)
+                        .unwrap();
+                    let Some(peer) = client.client.poll_recv(now) else {
+                        break;
+                    };
+                    let transmit = Transmit::new(
+                        peer.data(),
+                        peer.transport,
+                        peer.peer,
+                        client.client.relayed_addresses().next().unwrap().1,
+                    );
+                    // only a single ignorable can be returned
+                    if let Some(ignorable) = ignorable.take() {
+                        self.send_ignorable_error(ignorable);
+                    }
+                    self.incoming_turn_peer_data(
+                        checklist_i,
+                        component_id,
+                        transmit,
+                        turn_client_id,
+                        now,
+                        ignorable,
+                        &mut reply,
+                    );
+                }
+            }
+            return reply;
         }
 
-        self.incoming_data_or_stun(
+        self.incoming_data_or_stun(checklist_i, component_id, transmit, None, now, ignorable)
+    }
+
+    /// Handle a single message received from a TURN peer and accumulate the result into `reply`.
+    ///
+    /// Any application data is copied in order into the pending receive queue as it cannot
+    /// reference the original input.
+    #[allow(clippy::too_many_arguments)]
+    fn incoming_turn_peer_data<
+        D: AsRef<[u8]> + core::fmt::Debug,
+        R: AsRef<[u8]> + core::fmt::Debug,
+    >(
+        &mut self,
+        checklist_i: usize,
+        component_id: usize,
+        transmit: Transmit<D>,
+        turn_client_id: Option<(StunAgentId, SocketAddr)>,
+        now: Instant,
+        ignorable: &mut Option<RecvIgnorable>,
+        reply: &mut HandleRecvReply<R>,
+    ) {
+        // any further data from the same peer message has already been queued in
+        // `pending_recv` and must be delivered after the data returned here.
+        let pos = self.checklists[checklist_i].pending_recv.len();
+        let ret = self.incoming_data_or_stun(
             checklist_i,
             component_id,
             transmit,
             turn_client_id,
             now,
             ignorable,
-        )
+        );
+        reply.handled |= ret.handled;
+        reply.have_more_data = true;
+        if let Some(data) = ret.data.as_ref() {
+            self.checklists[checklist_i].pending_recv.insert(
+                pos,
+                PendingRecv {
+                    component_id,
+                    data: data.as_ref().to_vec(),
+                },
+            );
+        }
     }
 
     fn handle_binding_request(
@@ -8112,6 +8138,288 @@ mod tests {
             assert_eq!(received.data, payload);
         }
         assert!(state.local_list().poll_recv().is_none());
+    }
+
+    struct TurnTcpPeer {
+        state: FineControl,
+        turn_server: TurnServer,
+        local_addr: SocketAddr,
+        turn_addr: SocketAddr,
+        turn_alloc_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        /// CREATE_PERMISSION response for `peer_addr` that has not been provided to the
+        /// checklist set.
+        permission_response: Vec<u8>,
+        now: Instant,
+    }
+
+    impl TurnTcpPeer {
+        fn new() -> Self {
+            let local_addr = "127.0.0.1:1".parse::<SocketAddr>().unwrap();
+            let turn_addr = "127.0.0.1:3478".parse::<SocketAddr>().unwrap();
+            let turn_alloc_addr = "127.0.0.1:3000".parse::<SocketAddr>().unwrap();
+            let credentials = TurnCredentials::new("tuser", "tpass");
+            let mut state = FineControl::builder()
+                .local_candidate(
+                    Candidate::builder(
+                        1,
+                        CandidateType::Relayed,
+                        TransportType::Udp,
+                        "0",
+                        turn_alloc_addr,
+                    )
+                    .priority(8000)
+                    .base_address(turn_alloc_addr)
+                    .related_address(local_addr)
+                    .build(),
+                )
+                .trickle_ice(true)
+                .build();
+            let peer_addr = state.remote.candidate.address;
+            let now = Instant::ZERO;
+            let mut turn_server =
+                TurnServer::new(TransportType::Tcp, turn_addr, "realm".to_owned());
+            turn_server.add_user(
+                credentials.username().to_owned(),
+                credentials.password().to_owned(),
+            );
+            let mut turn_client = TurnClient::from(TurnClientTcp::allocate(
+                local_addr,
+                turn_addr,
+                turn_client_proto::api::TurnConfig::new(credentials),
+            ));
+            let now = turn_allocate(&mut turn_client, &mut turn_server, turn_alloc_addr, now);
+            let remote_candidate = state.remote.candidate.clone();
+            state.local_list().add_remote_candidate(remote_candidate);
+            let local_candidate = state.local.peer.candidate.clone();
+            state
+                .local_list()
+                .add_local_gathered_candidate(GatheredCandidate {
+                    candidate: local_candidate,
+                    turn_agent: Some(Box::new(turn_client)),
+                });
+            let now = match state.local.checklist_set.poll(now) {
+                CheckListSetPollRet::WaitUntil(now) => now,
+                ret => panic!("unexpected poll: {ret:?}"),
+            };
+            let transmit = state.local.checklist_set.poll_transmit(now).unwrap();
+            let msg = Message::from_bytes(&transmit.transmit.data).unwrap();
+            assert_eq!(msg.method(), CREATE_PERMISSION);
+            let permission_response = turn_server
+                .recv(transmit.transmit, now)
+                .unwrap()
+                .build()
+                .data
+                .as_slice()
+                .to_vec();
+
+            let agent_id = state
+                .local_list()
+                .find_agent_for_5tuple(TransportType::Udp, turn_alloc_addr, peer_addr)
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| {
+                    state
+                        .local_list()
+                        .add_agent_for_5tuple(TransportType::Udp, turn_alloc_addr, peer_addr, None)
+                        .0
+                });
+            state
+                .local_list()
+                .mut_agent_by_id(agent_id)
+                .unwrap()
+                .validated_peer(peer_addr);
+
+            Self {
+                state,
+                turn_server,
+                local_addr,
+                turn_addr,
+                turn_alloc_addr,
+                peer_addr,
+                permission_response,
+                now,
+            }
+        }
+
+        fn recv(
+            &mut self,
+            data: Vec<u8>,
+            ignorable: &mut Option<RecvIgnorable>,
+        ) -> HandleRecvReply<Vec<u8>> {
+            let transmit = Transmit::new(data, TransportType::Tcp, self.turn_addr, self.local_addr);
+            let checklist_id = self.state.local.checklist_id;
+            self.state.local.checklist_set.incoming_data(
+                checklist_id,
+                1,
+                transmit,
+                self.now,
+                ignorable,
+            )
+        }
+
+        fn has_permission(&mut self, peer: SocketAddr) -> bool {
+            let (local_addr, turn_addr, turn_alloc_addr) =
+                (self.local_addr, self.turn_addr, self.turn_alloc_addr);
+            self.state
+                .local_list()
+                .find_turn_client_for_5tuple(TransportType::Tcp, local_addr, turn_addr)
+                .unwrap()
+                .1
+                .permissions(TransportType::Udp, turn_alloc_addr)
+                .any(|ip| ip == peer.ip())
+        }
+
+        fn assert_recv_payloads(&mut self, payloads: &[Vec<u8>]) {
+            for payload in payloads {
+                let received = self.state.local_list().poll_recv().unwrap();
+                assert_eq!(received.component_id, 1);
+                assert_eq!(&received.data, payload);
+            }
+            assert!(self.state.local_list().poll_recv().is_none());
+        }
+
+        fn pending_error_responses(&self) -> usize {
+            self.state
+                .local
+                .checklist_set
+                .pending_messages
+                .iter()
+                .filter(|pending| {
+                    pending.to == self.peer_addr
+                        && Message::from_bytes(&pending.msg)
+                            .is_ok_and(|msg| msg.has_class(MessageClass::Error))
+                })
+                .count()
+        }
+    }
+
+    fn turn_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut msg = Message::builder_indication(DATA, MessageWriteVec::new());
+        msg.add_attribute(&XorPeerAddress::new(peer_addr, msg.transaction_id()))
+            .unwrap();
+        msg.add_attribute(&TurnData::new(payload)).unwrap();
+        msg.finish()
+    }
+
+    #[test]
+    fn turn_tcp_peer_data_and_stun_in_one_recv() {
+        let _log = crate::tests::test_init_log();
+        // a request without integrity is handled by queueing a 401 error response
+        let stun = Message::builder_request(BINDING, MessageWriteVec::new()).finish();
+        for stun_first in [false, true] {
+            let mut test = TurnTcpPeer::new();
+            let permission_response = test.permission_response.clone();
+            test.recv(permission_response, &mut None);
+
+            let payloads = [vec![1u8; 160], vec![2u8; 1296]];
+            let mut tcp_data = Vec::new();
+            if stun_first {
+                tcp_data.extend(turn_data_indication(test.peer_addr, &stun));
+            }
+            tcp_data.extend(turn_data_indication(test.peer_addr, &payloads[0]));
+            if !stun_first {
+                tcp_data.extend(turn_data_indication(test.peer_addr, &stun));
+            }
+            tcp_data.extend(turn_data_indication(test.peer_addr, &payloads[1]));
+
+            let reply = test.recv(tcp_data, &mut None);
+            assert!(reply.handled);
+            assert!(reply.have_more_data);
+            assert!(reply.data.is_none());
+            test.assert_recv_payloads(&payloads);
+            assert_eq!(test.pending_error_responses(), 1);
+        }
+    }
+
+    #[test]
+    fn turn_tcp_peer_data_and_turn_control_in_one_recv() {
+        let _log = crate::tests::test_init_log();
+        let mut test = TurnTcpPeer::new();
+
+        // TURN control before peer data
+        let payloads = [vec![1u8; 160], vec![2u8; 1296]];
+        let mut tcp_data = test.permission_response.clone();
+        for payload in &payloads {
+            tcp_data.extend(turn_data_indication(test.peer_addr, payload));
+        }
+        let reply = test.recv(tcp_data, &mut None);
+        assert!(reply.have_more_data);
+        assert!(reply.data.is_none());
+        test.assert_recv_payloads(&payloads);
+        assert!(test.has_permission(test.peer_addr));
+
+        // TURN control after peer data that is only consumed while draining the TURN client
+        let peer2_addr = "127.0.0.2:2".parse::<SocketAddr>().unwrap();
+        let (local_addr, turn_addr, now) = (test.local_addr, test.turn_addr, test.now);
+        let turn_id = test
+            .state
+            .local_list()
+            .find_turn_client_for_5tuple(TransportType::Tcp, local_addr, turn_addr)
+            .unwrap()
+            .0;
+        let permission_response = {
+            let client = &mut test
+                .state
+                .local_list()
+                .mut_turn_client_by_id(turn_id)
+                .unwrap()
+                .client;
+            assert!(
+                client
+                    .create_permission(TransportType::Udp, peer2_addr.ip(), now)
+                    .is_ok()
+            );
+            let transmit = client.poll_transmit(now).unwrap();
+            test.turn_server
+                .recv(transmit, now)
+                .unwrap()
+                .build()
+                .data
+                .as_slice()
+                .to_vec()
+        };
+        let payloads = [vec![3u8; 100]];
+        let mut tcp_data = turn_data_indication(test.peer_addr, &payloads[0]);
+        tcp_data.extend(permission_response);
+        let reply = test.recv(tcp_data, &mut None);
+        assert!(reply.have_more_data);
+        assert!(reply.data.is_none());
+        test.assert_recv_payloads(&payloads);
+        assert!(test.has_permission(peer2_addr));
+    }
+
+    #[test]
+    fn turn_tcp_multiple_ignorable_in_one_recv() {
+        let _log = crate::tests::test_init_log();
+        let mut test = TurnTcpPeer::new();
+        let permission_response = test.permission_response.clone();
+        test.recv(permission_response, &mut None);
+
+        let correct = test.state.local.peer.local_credentials.clone().unwrap();
+        test.state.remote.remote_credentials = Some(Credentials::new(
+            correct.ufrag.clone(),
+            correct.passwd.clone() + "wrong",
+        ));
+        let mut remote_agent = StunAgent::builder(TransportType::Udp, test.peer_addr).build();
+        let mut tcp_data = Vec::new();
+        for _ in 0..2 {
+            let check = remote_generate_check(
+                &test.state.remote,
+                &mut remote_agent,
+                test.turn_alloc_addr,
+                false,
+                false,
+                test.now,
+            );
+            tcp_data.extend(turn_data_indication(test.peer_addr, &check.data));
+        }
+
+        let mut ignorable = None;
+        let reply = test.recv(tcp_data, &mut ignorable);
+        assert!(reply.handled);
+        // only a single ignorable can be returned, any earlier one must be sent
+        assert!(ignorable.is_some());
+        assert_eq!(test.pending_error_responses(), 1);
     }
 
     #[test]
