@@ -18,7 +18,7 @@ use stun_proto::Instant;
 use stun_proto::agent::{StunError, Transmit};
 use stun_proto::types::data::Data;
 
-use crate::agent::{Agent, AgentError};
+use crate::agent::{Agent, AgentError, AgentWork};
 use crate::component::{Component, ComponentMut, ComponentState, GatherProgress};
 use crate::conncheck::{HandleRecvReply, PendingRecv, RequestRto};
 
@@ -374,7 +374,7 @@ impl<'a> StreamMut<'a> {
 
     /// Provide the stream with data that has been received on an external socket.  The returned
     /// value indicates what has been done with the data and any application data that has been
-    /// received.
+    /// received.  [`Agent::work`] indicates whether the [`Agent`] needs to be serviced afterwards.
     #[tracing::instrument(
         name = "stream_handle_incoming_data",
         level = "trace",
@@ -393,6 +393,13 @@ impl<'a> StreamMut<'a> {
     ) -> HandleRecvReply<T> {
         let stream_state = self.agent.mut_stream_state(self.id).unwrap();
         let checklist_id = stream_state.checklist_id;
+        if stream_state.gather_wants_data(component_id, &transmit) {
+            // gathering may make progress even if the data is not handled
+            self.agent
+                .checklistset
+                .add_work(AgentWork::POLL | AgentWork::TRANSMIT);
+        }
+        let stream_state = self.agent.mut_stream_state(self.id).unwrap();
         // first try to provide the incoming data to the gathering process if it exist
         let ret = stream_state.handle_incoming_data(component_id, &transmit, now);
         if ret.handled {
@@ -603,6 +610,20 @@ impl StreamState {
         debug_assert!(component_id > 0);
         self.components.remove(component_id - 1);
         trace!("Removed component at index {}", component_id);
+    }
+
+    pub(crate) fn gather_wants_data<T: AsRef<[u8]>>(
+        &self,
+        component_id: usize,
+        transmit: &Transmit<T>,
+    ) -> bool {
+        self.component_state(component_id).is_some_and(|component| {
+            component.gather_state == GatherProgress::InProgress
+                && component
+                    .gatherer
+                    .as_ref()
+                    .is_some_and(|gather| gather.wants_data(transmit))
+        })
     }
 
     pub(crate) fn handle_incoming_data<T: AsRef<[u8]> + core::fmt::Debug>(

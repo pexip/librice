@@ -518,6 +518,16 @@ impl Agent {
         )
     )]
     pub fn poll(&mut self, now: Instant) -> AgentPoll {
+        // any progress may produce data to send
+        self.checklistset.add_work(AgentWork::TRANSMIT);
+        let ret = self.poll_inner(now);
+        if matches!(ret, AgentPoll::WaitUntil(_) | AgentPoll::Closed) {
+            self.checklistset.remove_work(AgentWork::POLL);
+        }
+        ret
+    }
+
+    fn poll_inner(&mut self, now: Instant) -> AgentPoll {
         let mut lowest_wait = None;
 
         for stream in self.streams.iter_mut() {
@@ -785,10 +795,16 @@ impl Agent {
         for stream in self.streams.iter_mut() {
             let stream_id = stream.id();
             if let Some((_component_id, transmit)) = stream.poll_gather_transmit(now) {
+                // sending may change the earliest deadline
+                self.checklistset.add_work(AgentWork::POLL);
                 return Some(AgentTransmit::from_data(stream_id, transmit));
             }
         }
-        let transmit = self.checklistset.poll_transmit(now)?;
+        let Some(transmit) = self.checklistset.poll_transmit(now) else {
+            self.checklistset.remove_work(AgentWork::TRANSMIT);
+            return None;
+        };
+        self.checklistset.add_work(AgentWork::POLL);
         if let Some(stream) = self
             .streams
             .iter()
@@ -805,6 +821,39 @@ impl Agent {
             );
             None
         }
+    }
+
+    /// The work currently required to be performed for this [`Agent`] across all streams and
+    /// components.  See [`AgentWork`] for the meaning of the individual flags.
+    ///
+    /// This is intended to be checked after providing data with
+    /// [`StreamMut::handle_incoming_data`] or retrieving data with [`StreamMut::poll_recv`] in
+    /// order to determine whether [`Agent::poll`] and/or [`Agent::poll_transmit`] need to be
+    /// called before the deadline previously returned by [`Agent::poll`].
+    ///
+    /// Only the effects of processing received data and of servicing the [`Agent`] are tracked.
+    /// Any other modification of the [`Agent`] (e.g. adding a stream or remote candidates, or
+    /// setting credentials) still requires [`Agent::poll`] to be called afterwards.
+    ///
+    /// # Synchronization
+    ///
+    /// [`AgentWork::POLL`] and [`AgentWork::TRANSMIT`] are only cleared by [`Agent::poll`] and
+    /// [`Agent::poll_transmit`] respectively.  When an [`Agent`] is shared between threads (e.g.
+    /// behind a mutex), work latched by one thread is therefore never lost: either it is still
+    /// reported, or another thread has since serviced the [`Agent`] and is responsible for the
+    /// results (including the deadline) that it retrieved.  The work retrieved while holding the
+    /// same lock as the processing of some data covers that processing, but may also include
+    /// work from other operations.
+    pub fn work(&self) -> AgentWork {
+        self.checklistset.work()
+    }
+
+    /// A value that changes (wrapping) whenever work is latched by this [`Agent`].
+    ///
+    /// Comparing two values detects whether any work has been latched in between, even if that
+    /// work has since been performed.  See [`Agent::work`].
+    pub fn work_generation(&self) -> u64 {
+        self.checklistset.work_generation()
     }
 
     /// If consent freshness is enabled for this [`Agent`]
@@ -839,6 +888,104 @@ impl Agent {
         if let Some(cf) = &mut self.consent_freshness {
             cf.set_config(config);
         }
+    }
+}
+
+/// Work that may need to be performed for an [`Agent`].  Retrieved with [`Agent::work`].
+///
+/// Processing incoming data may produce protocol work (progress, events, a changed deadline, or
+/// data to transmit) that is serviced by calling [`Agent::poll`] and [`Agent::poll_transmit`].
+/// [`AgentWork`] allows the caller to determine whether that is needed instead of servicing the
+/// [`Agent`] after every received packet.
+///
+/// - [`AgentWork::POLL`] and [`AgentWork::TRANSMIT`] are latched until the corresponding service
+///   has completed.  They are not cleared by any other operation, e.g. processing further
+///   incoming data or [`StreamMut::poll_recv`] returning no data.
+/// - [`AgentWork::RECV`] and [`AgentWork::INPUT_INCOMPLETE`] reflect the current state of the
+///   [`Agent`] and do not by themselves require servicing the [`Agent`].
+///
+/// If neither [`AgentWork::POLL`] nor [`AgentWork::TRANSMIT`] is set, then no processing since
+/// the [`Agent`] was last serviced has produced any protocol work, and the deadline last
+/// returned by [`Agent::poll`] remains valid.  That deadline must still be honoured.  Work may
+/// be reported when none is actually required, but required work is always reported.
+///
+/// The [`Agent`] can be serviced with a loop similar to:
+///
+/// ```
+/// # use rice_proto::agent::{Agent, AgentPoll, AgentWork};
+/// # let mut agent = Agent::default();
+/// # let now = stun_proto::Instant::ZERO;
+/// while agent.work().intersects(AgentWork::POLL | AgentWork::TRANSMIT) {
+///     loop {
+///         match agent.poll(now) {
+///             // install a timer for the deadline, even if it has already passed
+///             AgentPoll::WaitUntil(_deadline) => break,
+///             AgentPoll::Closed => break,
+///             // handle the event
+///             _ => (),
+///         }
+///     }
+///     while let Some(_transmit) = agent.poll_transmit(now) {
+///         // send the data
+///     }
+/// }
+/// ```
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AgentWork(u32);
+
+impl AgentWork {
+    /// [`Agent::poll`] must be called until it returns [`AgentPoll::WaitUntil`] or
+    /// [`AgentPoll::Closed`].  The returned deadline replaces any previous deadline.
+    pub const POLL: Self = Self(1 << 0);
+    /// [`Agent::poll_transmit`] must be called until it returns `None`.
+    pub const TRANSMIT: Self = Self(1 << 1);
+    /// Received application data can be retrieved with [`StreamMut::poll_recv`].
+    pub const RECV: Self = Self(1 << 2);
+    /// Incomplete data has been buffered that requires more data from the network before any
+    /// progress can be made.
+    pub const INPUT_INCOMPLETE: Self = Self(1 << 3);
+
+    /// No work.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// The raw value of the flags.
+    pub const fn bits(&self) -> u32 {
+        self.0
+    }
+
+    /// Whether no flags are set.
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether all the flags in `other` are set.
+    pub const fn contains(&self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether any of the flags in `other` are set.
+    pub const fn intersects(&self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub(crate) fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+}
+
+impl core::ops::BitOr for AgentWork {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitOrAssign for AgentWork {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
     }
 }
 

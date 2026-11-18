@@ -55,7 +55,7 @@ use core::str::FromStr;
 use std::sync::{Mutex, Once};
 
 use crate::agent::AgentPoll;
-use crate::agent::{Agent, AgentError};
+use crate::agent::{Agent, AgentError, AgentWork};
 use crate::candidate::{Candidate, CandidatePair, CandidateType, TransportType};
 use crate::component::{ComponentConnectionState, SendData};
 use crate::consent;
@@ -993,6 +993,34 @@ pub unsafe extern "C" fn rice_agent_poll_transmit(
         } else {
             *transmit = RiceTransmit::default();
         }
+
+        drop(proto_agent);
+        core::mem::forget(agent);
+    }
+}
+
+/// Retrieve the work that currently needs to be performed for the `RiceAgent` across all streams
+/// and components.
+///
+/// `work->size` must be initialized before calling this function.  See `RiceWork`.
+///
+/// This is intended to be called after `rice_stream_handle_incoming_data()` or
+/// `rice_stream_poll_recv()` in order to determine whether `rice_agent_poll()` and/or
+/// `rice_agent_poll_transmit()` need to be called before the deadline previously returned by
+/// `rice_agent_poll()`.  Any other modification of the `RiceAgent` (e.g. adding a stream or
+/// candidates, or setting credentials) still requires `rice_agent_poll()` to be called afterwards.
+///
+/// Each function locks the `RiceAgent` independently and a sequence of calls is not atomic.
+/// `RICE_WORK_FLAGS_POLL` and `RICE_WORK_FLAGS_TRANSMIT` are only cleared by `rice_agent_poll()`
+/// and `rice_agent_poll_transmit()` respectively, so work added by another thread is never lost:
+/// it is either still reported, or another thread has since serviced the `RiceAgent` and is
+/// responsible for the results (including the deadline) that it retrieved.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_agent_get_work(agent: *const RiceAgent, work: *mut RiceWork) {
+    unsafe {
+        let agent = Arc::from_raw(agent);
+        let proto_agent = agent.proto_agent.lock().unwrap();
+        rice_work_fill(work, &proto_agent);
 
         drop(proto_agent);
         core::mem::forget(agent);
@@ -2908,6 +2936,78 @@ pub struct RiceStreamIncomingData {
     data: RiceData,
 }
 
+/// Work that may need to be performed for a `RiceAgent`.  Values are combined in
+/// `RiceWork::flags`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RiceWorkFlags {
+    /// `rice_agent_poll()` must be called until it returns `RICE_AGENT_POLL_WAIT_UNTIL_NANOS` or
+    /// `RICE_AGENT_POLL_CLOSED`.  The returned deadline replaces any previous deadline.
+    Poll = 1,
+    /// `rice_agent_poll_transmit()` must be called until it returns no data.
+    Transmit = 2,
+    /// Received application data can be retrieved with `rice_stream_poll_recv()`.
+    Recv = 4,
+    /// Incomplete data has been buffered that requires more data from the network before any
+    /// progress can be made.
+    InputIncomplete = 8,
+}
+
+const _: () = assert!(RiceWorkFlags::Poll as u32 == AgentWork::POLL.bits());
+const _: () = assert!(RiceWorkFlags::Transmit as u32 == AgentWork::TRANSMIT.bits());
+const _: () = assert!(RiceWorkFlags::Recv as u32 == AgentWork::RECV.bits());
+const _: () = assert!(RiceWorkFlags::InputIncomplete as u32 == AgentWork::INPUT_INCOMPLETE.bits());
+
+/// The work that may need to be performed for a `RiceAgent`.
+///
+/// `size` must be initialized to the size of the structure (`sizeof(RiceWork)`) by the caller.
+/// Only fields that are completely contained within `size` are written and `size` is updated to
+/// the number of bytes that are valid.  Fields may be added to the end of this structure in the
+/// future.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct RiceWork {
+    /// The size of this structure in bytes.
+    pub size: usize,
+    /// A combination of `RiceWorkFlags`.
+    ///
+    /// `RICE_WORK_FLAGS_POLL` and `RICE_WORK_FLAGS_TRANSMIT` remain set until
+    /// `rice_agent_poll()` and `rice_agent_poll_transmit()` (respectively) have been called
+    /// until they have no further results.  If neither is set, then no processing since then has
+    /// produced any work and the deadline last returned by `rice_agent_poll()` remains valid.
+    /// Work may be reported when none is actually required, but required work is always
+    /// reported.
+    ///
+    /// `RICE_WORK_FLAGS_RECV` and `RICE_WORK_FLAGS_INPUT_INCOMPLETE` reflect the current state
+    /// of the `RiceAgent` and do not by themselves require calling `rice_agent_poll()`.
+    pub flags: u32,
+    /// A value that changes (wrapping) whenever work is added to the `RiceAgent`, even if that
+    /// work has since been performed.
+    pub generation: u64,
+}
+
+unsafe fn rice_work_fill(work: *mut RiceWork, agent: &Agent) {
+    unsafe {
+        if work.is_null() {
+            return;
+        }
+        let size = (&raw const (*work).size).read();
+        let mut written = core::mem::size_of::<usize>();
+        let flags_end = core::mem::offset_of!(RiceWork, flags) + core::mem::size_of::<u32>();
+        if size >= flags_end {
+            (&raw mut (*work).flags).write(agent.work().bits());
+            written = flags_end;
+        }
+        let generation_end =
+            core::mem::offset_of!(RiceWork, generation) + core::mem::size_of::<u64>();
+        if size >= generation_end {
+            (&raw mut (*work).generation).write(agent.work_generation());
+            written = generation_end;
+        }
+        (&raw mut (*work).size).write(written);
+    }
+}
+
 /// An error reply that can be ignored if another agent handles the STUN message.
 ///
 /// Typically encountered when multiple agents are running using the same local socket in an
@@ -2962,6 +3062,44 @@ pub unsafe extern "C" fn rice_stream_handle_incoming_data(
     ignorable: *mut RiceRecvIgnorable,
 ) {
     unsafe {
+        rice_stream_handle_incoming_data_with_work(
+            stream,
+            component_id,
+            transport,
+            from,
+            to,
+            data,
+            data_len,
+            now_nanos,
+            ret,
+            ignorable,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Provide data to the `RiceStream` for processing and retrieve the work that is required for
+/// the `RiceAgent` afterwards.
+///
+/// The same as `rice_stream_handle_incoming_data()` with the addition of filling `work` (if not
+/// NULL) after the data has been processed, including sending any ignorable error when
+/// `ignorable` is NULL.  `work->size` must be initialized before calling this function.  See
+/// `RiceWork` and `rice_agent_get_work()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rice_stream_handle_incoming_data_with_work(
+    stream: *mut RiceStream,
+    component_id: usize,
+    transport: RiceTransportType,
+    from: *const RiceAddress,
+    to: *const RiceAddress,
+    data: *const u8,
+    data_len: usize,
+    now_nanos: i64,
+    ret: *mut RiceStreamIncomingData,
+    ignorable: *mut RiceRecvIgnorable,
+    work: *mut RiceWork,
+) {
+    unsafe {
         let stream = Arc::from_raw(stream);
         let now = Instant::from_nanos(now_nanos);
         let mut proto_agent = stream.proto_agent.lock().unwrap();
@@ -3004,6 +3142,7 @@ pub unsafe extern "C" fn rice_stream_handle_incoming_data(
         } else if let Some(ignorable) = ignorable_ret.take() {
             proto_stream.send_ignorable_error(ignorable);
         }
+        rice_work_fill(work, &proto_agent);
 
         drop(proto_agent);
         core::mem::forget(stream);

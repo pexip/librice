@@ -101,6 +101,15 @@ struct Request {
     completed: bool,
 }
 
+impl Request {
+    fn wants_data<T: AsRef<[u8]>>(&self, transmit: &Transmit<T>) -> bool {
+        !self.completed
+            && self.protocol.transport() == transmit.transport
+            && self.server == transmit.from
+            && self.base_addr == transmit.to
+    }
+}
+
 #[derive(Debug)]
 enum Method {
     Stun,
@@ -897,6 +906,13 @@ impl StunGatherer {
         Some(cand)
     }
 
+    /// Whether [`StunGatherer::handle_data`] may process (and change state because of) the data.
+    pub(crate) fn wants_data<T: AsRef<[u8]>>(&self, transmit: &Transmit<T>) -> bool {
+        self.requests
+            .iter()
+            .any(|request| request.wants_data(transmit))
+    }
+
     /// Provide the gatherer with data received from a socket.  If [`HandleStunReply::StunResponse`] is
     /// returned, then `poll()` should to be called at the next earliest opportunity.
     #[tracing::instrument(
@@ -926,11 +942,7 @@ impl StunGatherer {
 
         let mut handled = false;
         for request in self.requests.iter_mut() {
-            if request.completed
-                || request.protocol.transport() != transmit.transport
-                || request.server != transmit.from
-                || request.base_addr != transmit.to
-            {
+            if !request.wants_data(transmit) {
                 continue;
             }
             match &mut request.agent {

@@ -101,6 +101,15 @@ pub const RICE_TRANSPORT_TYPE_UDP: RiceTransportType = 0;
 #[doc = " The TCP transport"]
 pub const RICE_TRANSPORT_TYPE_TCP: RiceTransportType = 1;
 pub type RiceTransportType = u32;
+#[doc = " `rice_agent_poll()` must be called until it returns `RICE_AGENT_POLL_WAIT_UNTIL_NANOS` or\n `RICE_AGENT_POLL_CLOSED`.  The returned deadline replaces any previous deadline."]
+pub const RICE_WORK_FLAGS_POLL: RiceWorkFlags = 1;
+#[doc = " `rice_agent_poll_transmit()` must be called until it returns no data."]
+pub const RICE_WORK_FLAGS_TRANSMIT: RiceWorkFlags = 2;
+#[doc = " Received application data can be retrieved with `rice_stream_poll_recv()`."]
+pub const RICE_WORK_FLAGS_RECV: RiceWorkFlags = 4;
+#[doc = " Incomplete data has been buffered that requires more data from the network before any\n progress can be made."]
+pub const RICE_WORK_FLAGS_INPUT_INCOMPLETE: RiceWorkFlags = 8;
+pub type RiceWorkFlags = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct Credentials {
@@ -629,6 +638,26 @@ const _: () = {
     ["Offset of field: RiceStreamIncomingData::data"]
         [::core::mem::offset_of!(RiceStreamIncomingData, data) - 8usize];
 };
+#[doc = " The work that may need to be performed for a `RiceAgent`.\n\n `size` must be initialized to the size of the structure (`sizeof(RiceWork)`) by the caller.\n Only fields that are completely contained within `size` are written and `size` is updated to\n the number of bytes that are valid.  Fields may be added to the end of this structure in the\n future."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RiceWork {
+    #[doc = " The size of this structure in bytes."]
+    pub size: usize,
+    #[doc = " A combination of `RiceWorkFlags`.\n\n `RICE_WORK_FLAGS_POLL` and `RICE_WORK_FLAGS_TRANSMIT` remain set until\n `rice_agent_poll()` and `rice_agent_poll_transmit()` (respectively) have been called\n until they have no further results.  If neither is set, then no processing since then has\n produced any work and the deadline last returned by `rice_agent_poll()` remains valid.\n Work may be reported when none is actually required, but required work is always\n reported.\n\n `RICE_WORK_FLAGS_RECV` and `RICE_WORK_FLAGS_INPUT_INCOMPLETE` reflect the current state\n of the `RiceAgent` and do not by themselves require calling `rice_agent_poll()`."]
+    pub flags: u32,
+    #[doc = " A value that changes (wrapping) whenever work is added to the `RiceAgent`, even if that\n work has since been performed."]
+    pub generation: u64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RiceWork"][::core::mem::size_of::<RiceWork>() - 24usize];
+    ["Alignment of RiceWork"][::core::mem::align_of::<RiceWork>() - 8usize];
+    ["Offset of field: RiceWork::size"][::core::mem::offset_of!(RiceWork, size) - 0usize];
+    ["Offset of field: RiceWork::flags"][::core::mem::offset_of!(RiceWork, flags) - 8usize];
+    ["Offset of field: RiceWork::generation"]
+        [::core::mem::offset_of!(RiceWork, generation) - 16usize];
+};
 unsafe extern "C" {
     #[doc = " Query the built version of `rice-proto`."]
     pub fn rice_version(major: *mut u32, minor: *mut u32, patch: *mut u32);
@@ -746,6 +775,10 @@ unsafe extern "C" {
         now_nanos: i64,
         transmit: *mut RiceTransmit,
     );
+}
+unsafe extern "C" {
+    #[doc = " Retrieve the work that currently needs to be performed for the `RiceAgent` across all streams\n and components.\n\n `work->size` must be initialized before calling this function.  See `RiceWork`.\n\n This is intended to be called after `rice_stream_handle_incoming_data()` or\n `rice_stream_poll_recv()` in order to determine whether `rice_agent_poll()` and/or\n `rice_agent_poll_transmit()` need to be called before the deadline previously returned by\n `rice_agent_poll()`.  Any other modification of the `RiceAgent` (e.g. adding a stream or\n candidates, or setting credentials) still requires `rice_agent_poll()` to be called afterwards.\n\n Each function locks the `RiceAgent` independently and a sequence of calls is not atomic.\n `RICE_WORK_FLAGS_POLL` and `RICE_WORK_FLAGS_TRANSMIT` are only cleared by `rice_agent_poll()`\n and `rice_agent_poll_transmit()` respectively, so work added by another thread is never lost:\n it is either still reported, or another thread has since serviced the `RiceAgent` and is\n responsible for the results (including the deadline) that it retrieved."]
+    pub fn rice_agent_get_work(agent: *const RiceAgent, work: *mut RiceWork);
 }
 unsafe extern "C" {
     #[doc = " Add a STUN server to this `RiceAgent`."]
@@ -1200,6 +1233,22 @@ unsafe extern "C" {
         now_nanos: i64,
         ret: *mut RiceStreamIncomingData,
         ignorable: *mut RiceRecvIgnorable,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Provide data to the `RiceStream` for processing and retrieve the work that is required for\n the `RiceAgent` afterwards.\n\n The same as `rice_stream_handle_incoming_data()` with the addition of filling `work` (if not\n NULL) after the data has been processed, including sending any ignorable error when\n `ignorable` is NULL.  `work->size` must be initialized before calling this function.  See\n `RiceWork` and `rice_agent_get_work()`."]
+    pub fn rice_stream_handle_incoming_data_with_work(
+        stream: *mut RiceStream,
+        component_id: usize,
+        transport: RiceTransportType,
+        from: *const RiceAddress,
+        to: *const RiceAddress,
+        data: *const u8,
+        data_len: usize,
+        now_nanos: i64,
+        ret: *mut RiceStreamIncomingData,
+        ignorable: *mut RiceRecvIgnorable,
+        work: *mut RiceWork,
     );
 }
 unsafe extern "C" {
