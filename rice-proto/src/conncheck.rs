@@ -23,6 +23,7 @@ use core::time::Duration;
 use stun_proto::auth::ShortTermAuth;
 
 use crate::ALPHABET;
+use crate::agent::AgentWork;
 use crate::candidate::{Candidate, CandidatePair, CandidateType, TcpType, TransportType};
 use crate::component::ComponentConnectionState;
 use crate::gathering::GatheredCandidate;
@@ -2387,6 +2388,8 @@ impl ConnCheckListSetBuilder {
             consent_tids: Vec::new(),
             consent_responses: Vec::new(),
             local_consent_revoked: Vec::new(),
+            work: AgentWork::POLL | AgentWork::TRANSMIT,
+            work_generation: 0,
         }
     }
 }
@@ -2420,6 +2423,9 @@ pub struct ConnCheckListSet {
     /// Local consent revocation: (checklist_id, component_id). When present,
     /// incoming Binding Requests from peer are answered with 403 Forbidden.
     local_consent_revoked: Vec<(usize, usize)>,
+    /// Latched work that is cleared only by performing the corresponding service.
+    work: AgentWork,
+    work_generation: u64,
 }
 
 impl ConnCheckListSet {
@@ -2428,6 +2434,34 @@ impl ConnCheckListSet {
     /// Create a [`ConnCheckListSetBuilder`]
     pub fn builder(tie_breaker: u64, controlling: bool) -> ConnCheckListSetBuilder {
         ConnCheckListSetBuilder::new(tie_breaker, controlling)
+    }
+
+    pub(crate) fn add_work(&mut self, work: AgentWork) {
+        self.work |= work;
+        self.work_generation = self.work_generation.wrapping_add(1);
+    }
+
+    pub(crate) fn remove_work(&mut self, work: AgentWork) {
+        self.work.remove(work);
+    }
+
+    pub(crate) fn work(&self) -> AgentWork {
+        let mut work = self.work;
+        if self.checklists.iter().any(|cl| !cl.pending_recv.is_empty()) {
+            work |= AgentWork::RECV;
+        }
+        if self
+            .checklists
+            .iter()
+            .any(|cl| cl.tcp_buffers.values().any(|tcp| !tcp.is_empty()))
+        {
+            work |= AgentWork::INPUT_INCOMPLETE;
+        }
+        work
+    }
+
+    pub(crate) fn work_generation(&self) -> u64 {
+        self.work_generation
     }
 
     /// Construct a new [`ConnCheckList`] and return its ID.
@@ -2677,6 +2711,9 @@ impl ConnCheckListSet {
     ) -> HandleRecvReply<T> {
         match Message::from_bytes(transmit.data.as_ref()) {
             Ok(msg) => {
+                // any STUN message may change the state of the agent (transactions, checks,
+                // consent, role, selected pair, deadlines) or require a reply.
+                self.add_work(AgentWork::POLL | AgentWork::TRANSMIT);
                 let msg_transmit =
                     Transmit::new(msg, transmit.transport, transmit.from, transmit.to);
                 if self.handle_stun(
@@ -2913,6 +2950,9 @@ impl ConnCheckListSet {
                 })
             })
         {
+            // The TURN client may change state (e.g. by consuming TURN control messages) without
+            // that being visible in the returned values.
+            self.add_work(AgentWork::POLL | AgentWork::TRANSMIT);
             let client = self.checklists[checklist_i]
                 .mut_turn_client_by_id(turn_id)
                 .unwrap();
@@ -4770,6 +4810,8 @@ impl ConnCheckListSet {
             turn_id: ignorable.turn_id,
             consent_cid: None,
         });
+        // the queued reply is sent by poll_transmit()
+        self.add_work(AgentWork::TRANSMIT);
     }
 
     pub fn close(&mut self, now: Instant) {
@@ -8291,6 +8333,17 @@ mod tests {
                 })
                 .count()
         }
+
+        fn clear_work(&mut self) {
+            self.state
+                .local
+                .checklist_set
+                .remove_work(AgentWork::POLL | AgentWork::TRANSMIT);
+        }
+
+        fn work(&self) -> AgentWork {
+            self.state.local.checklist_set.work()
+        }
     }
 
     fn turn_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -8322,11 +8375,17 @@ mod tests {
             }
             tcp_data.extend(turn_data_indication(test.peer_addr, &payloads[1]));
 
+            test.clear_work();
             let reply = test.recv(tcp_data, &mut None);
             assert!(reply.handled);
             assert!(reply.have_more_data);
             assert!(reply.data.is_none());
+            assert!(
+                test.work()
+                    .contains(AgentWork::POLL | AgentWork::TRANSMIT | AgentWork::RECV)
+            );
             test.assert_recv_payloads(&payloads);
+            assert!(!test.work().contains(AgentWork::RECV));
             assert_eq!(test.pending_error_responses(), 1);
         }
     }
@@ -8381,9 +8440,12 @@ mod tests {
         let payloads = [vec![3u8; 100]];
         let mut tcp_data = turn_data_indication(test.peer_addr, &payloads[0]);
         tcp_data.extend(permission_response);
+        test.clear_work();
         let reply = test.recv(tcp_data, &mut None);
         assert!(reply.have_more_data);
         assert!(reply.data.is_none());
+        // the TURN control message requires the agent to be serviced regardless of `handled`
+        assert!(test.work().contains(AgentWork::POLL | AgentWork::TRANSMIT));
         test.assert_recv_payloads(&payloads);
         assert!(test.has_permission(peer2_addr));
     }
@@ -8415,11 +8477,13 @@ mod tests {
         }
 
         let mut ignorable = None;
+        test.clear_work();
         let reply = test.recv(tcp_data, &mut ignorable);
         assert!(reply.handled);
         // only a single ignorable can be returned, any earlier one must be sent
         assert!(ignorable.is_some());
         assert_eq!(test.pending_error_responses(), 1);
+        assert!(test.work().contains(AgentWork::TRANSMIT));
     }
 
     #[test]

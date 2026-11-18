@@ -24,7 +24,7 @@ use turn_client_proto::api::TurnClientApi;
 
 use crate::candidate::{CandidatePair, CandidateType, TransportType};
 
-use crate::agent::{Agent, AgentError};
+use crate::agent::{Agent, AgentError, AgentWork};
 pub use crate::conncheck::SelectedPair;
 use crate::conncheck::{RequestRto, transmit_send_build_unframed};
 use crate::gathering::StunGatherer;
@@ -268,6 +268,12 @@ impl<'a> ComponentMut<'a> {
         let remote_addr = pair.remote.address;
 
         let data_len = data.as_ref().len();
+        if local_candidate_type == CandidateType::Relayed {
+            // the TURN client may need servicing after sending
+            self.agent
+                .checklistset
+                .add_work(AgentWork::POLL | AgentWork::TRANSMIT);
+        }
         let checklist = self
             .agent
             .checklistset
