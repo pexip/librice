@@ -8,6 +8,7 @@ usize_is_size_t = true
 
 [export]
 exclude = ["MAGIC_COOKIE", "BINDING", "RTP", "RTCP"]
+include = ["RiceWorkFlags"]
 item_types = ["enums", "structs", "opaque", "functions"]
 
 [export.rename]
